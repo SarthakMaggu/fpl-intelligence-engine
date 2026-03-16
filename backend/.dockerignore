@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+*.cover
+.hypothesis/
+
+# ML model artifacts (large binary files — bind-mounted as a volume in prod)
+models/ml/artifacts/*.pkl
+models/ml/artifacts/*.bin
+models/ml/artifacts/*.model
+
+# Tests
+tests/
+
+# Development
+.env
+.env.*
+!.env.example
+
+# macOS / IDE
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Git
+.git/
+.gitignore
