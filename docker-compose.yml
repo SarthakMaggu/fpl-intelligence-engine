@@ -56,7 +56,7 @@ services:
         condition: service_healthy
     volumes:
       - model_artifacts:/app/models/ml/artifacts
-    command: sh -c "alembic upgrade head && uvicorn main:app --host 0.0.0.0 --port 8000 --workers 2"
+    command: /app/entrypoint.sh
 
   worker:
     build:
@@ -74,6 +74,7 @@ services:
       PGDATABASE: fpl_intelligence
       DATABASE_URL: postgresql+asyncpg://postgres:${POSTGRES_PASSWORD:-changeme}@postgres:5432/fpl_intelligence
       REDIS_URL: redis://redis:6379/0
+      WORKER: "true"
     depends_on:
       postgres:
         condition: service_healthy
@@ -81,7 +82,7 @@ services:
         condition: service_healthy
     volumes:
       - model_artifacts:/app/models/ml/artifacts
-    command: sh -c "alembic upgrade head && python worker.py"
+    command: /app/entrypoint.sh
 
   frontend:
     build:
