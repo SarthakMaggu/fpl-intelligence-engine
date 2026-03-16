@@ -6,16 +6,16 @@ Work through this top to bottom before going live. Each section must be fully ch
 
 ## Part 1 — Infrastructure
 
-- [ ] Oracle Cloud VM is running Ubuntu 22.04, 4 vCPU / 24 GB RAM (Ampere A1 Flex)
+> See [DEPLOY.md](./DEPLOY.md) for DigitalOcean step-by-step setup.
+
+- [ ] Server running Ubuntu 22.04+, minimum 2 vCPU / 4 GB RAM (DigitalOcean Basic Droplet)
 - [ ] Docker 24+ installed: `docker --version`
 - [ ] Docker Compose plugin installed: `docker compose version`
-- [ ] OCI Security List allows TCP 22, 80, 443 from 0.0.0.0/0
-- [ ] Ubuntu iptables allow 80 and 443 (`sudo netfilter-persistent save`)
+- [ ] Firewall allows TCP 22, 80, 443 (DigitalOcean: Networking → Firewalls or UFW)
 - [ ] Nginx installed: `nginx -v`
 - [ ] Certbot installed: `certbot --version`
-- [ ] Domain DNS A records pointing to VM public IP (verified with `dig +short yourdomain.com`)
-- [ ] Backup directory created: `/home/ubuntu/backups/`
-- [ ] Backup cron jobs added to host crontab
+- [ ] Domain DNS A records pointing to Droplet IP (verified with `dig +short yourdomain.com`)
+- [ ] Backup directory created: `/root/backups/`
 
 ### Server Hardening (before launch)
 - [ ] SSH root login disabled (`PermitRootLogin no` in `/etc/ssh/sshd_config`)

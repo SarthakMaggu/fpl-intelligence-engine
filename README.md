@@ -55,25 +55,36 @@ docker compose up -d
 
 Backend runs `create_all` + `ALTER TABLE IF NOT EXISTS` migrations on startup. No manual steps.
 
-**On first start:** The historical backtest pipeline auto-triggers in the background (~2 min). The landing page performance strip shows a "computing" shimmer while it runs, then switches to real stats (MAE, hit rate, strategy advantage) once complete. This only runs once — data persists across restarts.
+**On first start:** Synthetic backtest data is seeded immediately (no network required, <1 second). The landing page performance strip shows stats instantly. To replace with real computed data from the vaastav dataset, trigger the backfill manually once the app is running:
+
+```bash
+curl -X POST -H "X-Admin-Token: $ADMIN_TOKEN" \
+  "http://localhost:8000/api/lab/run-backtest?seasons=2022-23,2023-24,2024-25"
+```
+
+If the strip is ever empty (e.g. after wiping the DB), re-seed with:
+
+```bash
+curl -X POST -H "X-Admin-Token: $ADMIN_TOKEN" http://localhost:8000/api/lab/reseed
+```
 
 ---
 
-## Running in production (Oracle Cloud Free Tier)
+## Deploying for real users
+
+See **[DEPLOY.md](./DEPLOY.md)** for full DigitalOcean step-by-step instructions to get a shareable HTTPS URL in ~20 minutes.
+
+Quick version (Ubuntu server with Docker):
 
 ```bash
-# On Ubuntu 22.04 VM (Ampere A1, 4 vCPU / 24 GB)
-curl -fsSL https://get.docker.com | sh
-sudo usermod -aG docker $USER && newgrp docker
-
 git clone <repo> && cd fpl-intelligence-engine
-cp .env.example .env.prod
-# Fill in all secrets (see Environment Variables below)
+cp .env.example .env
+# Fill in: SECRET_KEY, ADMIN_TOKEN, POSTGRES_PASSWORD, REDIS_PASSWORD, FPL_TEAM_ID, NEXT_PUBLIC_API_URL
 
-docker compose -f docker-compose.prod.yml --env-file .env.prod up -d
+docker compose -f docker-compose.prod.yml --env-file .env up -d
 ```
 
-PostgreSQL and Redis are not exposed externally in `docker-compose.prod.yml`. Add Nginx + Certbot for HTTPS.
+PostgreSQL and Redis are not exposed externally. Add Nginx + Certbot for HTTPS (see DEPLOY.md).
 
 ---
 
