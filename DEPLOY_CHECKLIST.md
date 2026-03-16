@@ -124,16 +124,21 @@ This gives you `https://your-app.vercel.app` — a public URL you can share with
 
 ### B2. Deploy backend on Railway
 
+> **CRITICAL — do steps 1–4 in this exact order before the first deploy succeeds.**
+> If you deploy before adding the PostgreSQL and Redis plugins, Alembic will fail
+> with "Connection refused to localhost:5433" because `DATABASE_URL` won't be set yet.
+> If this already happened, just add both plugins then click **Redeploy**.
+
 1. Railway dashboard → **New Project → Deploy from GitHub repo**
 2. Select `SarthakMaggu/fpl-intelligence-engine`
-3. Railway detects `railway.toml` and builds `backend/Dockerfile` automatically
-4. Once the build finishes, click **Add Plugin → PostgreSQL** (Railway managed)
-5. Click **Add Plugin → Redis** (Railway managed)
-6. Both plugins inject `DATABASE_URL` and `REDIS_URL` automatically — no manual config
+3. **Before the build finishes**, click **Add Plugin → PostgreSQL** (Railway managed)
+4. **Before the build finishes**, click **Add Plugin → Redis** (Railway managed)
+   - Both plugins inject `DATABASE_URL` and `REDIS_URL` into your service automatically
+5. Railway detects `railway.toml` and builds `backend/Dockerfile`
 
+- [ ] PostgreSQL plugin connected (shows green)
+- [ ] Redis plugin connected (shows green)
 - [ ] Build succeeds (green in Railway deploy log)
-- [ ] PostgreSQL plugin connected
-- [ ] Redis plugin connected
 
 **Set environment variables** (Settings → Variables on the backend service):
 
@@ -377,13 +382,14 @@ curl $BACKEND/api/lab/performance-summary
 
 | Symptom | Likely cause | Fix |
 |---------|-------------|-----|
-| CORS error in browser | `FRONTEND_URL` on Railway doesn't match Vercel URL | Update `FRONTEND_URL` on Railway, redeploy |
-| `has_data: false` on landing strip | DB not seeded | `curl -X POST $BACKEND/api/lab/reseed -H "X-Admin-Token: $TOKEN"` |
-| `database connection refused` on Railway | PostgreSQL plugin not attached | Railway → Add Plugin → PostgreSQL |
-| `Can't connect to Redis` | Redis plugin not attached | Railway → Add Plugin → Redis |
-| Frontend can't reach backend | Wrong `NEXT_PUBLIC_API_URL` in Vercel | Update env var in Vercel → redeploy |
-| WebSocket not connecting | `NEXT_PUBLIC_WS_URL` uses `ws://` instead of `wss://` | Update to `wss://` in Vercel → redeploy |
-| Alembic migration fails | DB doesn't exist yet | Railway creates it automatically — wait for plugin to fully provision, then redeploy |
-| Squad sync returns 404 | `FPL_TEAM_ID` not set | Add to Railway env vars |
-| Worker not processing jobs | Worker service stopped | Railway → worker service → Restart |
-| Build fails on Railway | Dockerfile issue | Check Railway build logs — usually a missing env var or Python dependency |
+| `Connection refused to localhost:5433` in Railway deploy log | PostgreSQL plugin not attached — `DATABASE_URL` was never injected, so Alembic fell back to the local default | Railway → your backend service → **Add Plugin → PostgreSQL** → then click **Redeploy** |
+| Same error even after adding plugin | Plugin was added AFTER the first deploy — env var wasn't visible to that build | Click **Redeploy** on the backend service |
+| `Can't connect to Redis` / Redis errors on startup | Redis plugin not attached | Railway → Add Plugin → Redis → Redeploy |
+| CORS error in browser | `FRONTEND_URL` on Railway doesn't match Vercel URL | Update `FRONTEND_URL` on Railway → Redeploy |
+| `has_data: false` on landing strip | DB seeded but not seen yet | `curl -X POST $BACKEND/api/lab/reseed -H "X-Admin-Token: $TOKEN"` |
+| Frontend can't reach backend | Wrong `NEXT_PUBLIC_API_URL` in Vercel env vars | Update in Vercel → Settings → Environment Variables → redeploy |
+| WebSocket not connecting | `NEXT_PUBLIC_WS_URL` uses `ws://` instead of `wss://` | Update to `wss://` in Vercel env vars → redeploy |
+| Squad sync returns 404 | `FPL_TEAM_ID` not set on Railway | Add to Railway backend service env vars |
+| Worker not processing jobs | Worker service stopped or crashed | Railway → worker service → Logs (diagnose) → Restart |
+| Build fails on Railway — Python error | Missing env var or import issue | Check Railway build logs for the specific traceback |
+| Vercel build fails | `NEXT_PUBLIC_API_URL` not set | Set it in Vercel → Settings → Environment Variables before deploying |

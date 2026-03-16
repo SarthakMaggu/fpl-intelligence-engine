@@ -62,16 +62,25 @@ class Settings(BaseSettings):
     TWILIO_WHATSAPP_FROM: str = "whatsapp:+14155238886"
     TWILIO_WHATSAPP_TO: str = ""
 
+    @staticmethod
+    def _normalise_url(raw: str, driver: str) -> str:
+        """Replace any postgres:// scheme variant with the given driver."""
+        for prefix in ("postgres://", "postgresql://", "postgresql+asyncpg://", "postgresql+psycopg2://"):
+            if raw.startswith(prefix):
+                return f"postgresql+{driver}://" + raw[len(prefix):]
+        return raw  # already has correct prefix or unrecognised
+
     @property
     def async_database_url(self) -> str:
-        """Return DATABASE_URL with the asyncpg driver.
-        Railway (and many hosts) inject a plain postgres:// URL — convert it."""
-        url = self.DATABASE_URL
-        if url.startswith("postgres://"):
-            url = "postgresql+asyncpg://" + url[len("postgres://"):]
-        elif url.startswith("postgresql://") and "+asyncpg" not in url:
-            url = "postgresql+asyncpg://" + url[len("postgresql://"):]
-        return url
+        """asyncpg URL — used by SQLAlchemy async engine (FastAPI app).
+        Handles postgres://, postgresql://, or postgresql+asyncpg:// input."""
+        return self._normalise_url(self.DATABASE_URL, "asyncpg")
+
+    @property
+    def sync_database_url(self) -> str:
+        """psycopg2 URL — used by Alembic migrations (sync driver).
+        Handles postgres://, postgresql://, or postgresql+asyncpg:// input."""
+        return self._normalise_url(self.DATABASE_URL, "psycopg2")
 
     @property
     def cors_origins(self) -> list[str]:
