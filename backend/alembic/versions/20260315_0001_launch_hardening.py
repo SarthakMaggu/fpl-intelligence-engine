@@ -23,38 +23,34 @@ def upgrade() -> None:
 
     # ── Step 1: create every table that doesn't exist yet ─────────────────────
     # On a fresh Railway DB this creates ALL tables (players, predictions,
-    # waitlist, background_jobs, etc.) in one shot using the current models.
-    # On an existing DB with tables already present, checkfirst=True is a no-op
-    # for those tables and only creates genuinely missing ones.
+    # waitlist, background_jobs, decision_log, etc.) with their FULL current
+    # schema in one shot.
+    # On an existing DB, checkfirst=True skips tables that already exist.
     Base.metadata.create_all(bind=bind, checkfirst=True)
 
     inspector = inspect(bind)
 
-    # ── Step 2: add new columns to predictions (idempotent) ───────────────────
-    # create_all(checkfirst=True) skips tables that already exist, so existing
-    # DBs won't get the new columns automatically — we add them here only when
-    # they're missing.
+    # ── Step 2: add columns to predictions only if missing ────────────────────
+    # create_all(checkfirst=True) skips EXISTING tables, so existing DBs that
+    # already had a predictions table without these columns need them added here.
     pred_cols = {c["name"] for c in inspector.get_columns("predictions")}
-    float_cols = [
-        "predicted_expected_minutes",
-        "predicted_goal_prob",
-        "predicted_assist_prob",
-        "predicted_clean_sheet_prob",
-        "predicted_card_prob",
-        "predicted_bonus_points",
-        "predicted_bench_prob",
-        "predicted_sub_appearance_prob",
-    ]
-    int_cols = ["data_snapshot_id", "feature_version_id", "model_version_id"]
-
-    for col_name in float_cols:
+    for col_name, col_type in [
+        ("predicted_expected_minutes", sa.Float()),
+        ("predicted_goal_prob", sa.Float()),
+        ("predicted_assist_prob", sa.Float()),
+        ("predicted_clean_sheet_prob", sa.Float()),
+        ("predicted_card_prob", sa.Float()),
+        ("predicted_bonus_points", sa.Float()),
+        ("predicted_bench_prob", sa.Float()),
+        ("predicted_sub_appearance_prob", sa.Float()),
+        ("data_snapshot_id", sa.Integer()),
+        ("feature_version_id", sa.Integer()),
+        ("model_version_id", sa.Integer()),
+    ]:
         if col_name not in pred_cols:
-            op.add_column("predictions", sa.Column(col_name, sa.Float(), nullable=True))
-    for col_name in int_cols:
-        if col_name not in pred_cols:
-            op.add_column("predictions", sa.Column(col_name, sa.Integer(), nullable=True))
+            op.add_column("predictions", sa.Column(col_name, col_type, nullable=True))
 
-    # ── Step 3: add new columns to waitlist (idempotent) ──────────────────────
+    # ── Step 3: add columns to waitlist only if missing ───────────────────────
     wait_cols = {c["name"] for c in inspector.get_columns("waitlist")}
     for col_name, col_type in [
         ("position", sa.Integer()),

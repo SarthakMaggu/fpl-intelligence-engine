@@ -16,17 +16,27 @@ depends_on = None
 
 
 def upgrade() -> None:
-    with op.batch_alter_table("decision_log") as batch_op:
-        batch_op.add_column(sa.Column("decision_score", sa.Float(), nullable=True))
-        batch_op.add_column(sa.Column("validation_status", sa.String(length=32), nullable=True))
-        batch_op.add_column(sa.Column("risk_preference", sa.String(length=32), nullable=True))
-        batch_op.add_column(sa.Column("floor_projection", sa.Float(), nullable=True))
-        batch_op.add_column(sa.Column("median_projection", sa.Float(), nullable=True))
-        batch_op.add_column(sa.Column("ceiling_projection", sa.Float(), nullable=True))
-        batch_op.add_column(sa.Column("projection_variance", sa.Float(), nullable=True))
-        batch_op.add_column(sa.Column("explanation_summary", sa.Text(), nullable=True))
-        batch_op.add_column(sa.Column("inputs_used_json", sa.Text(), nullable=True))
-        batch_op.add_column(sa.Column("simulation_summary_json", sa.Text(), nullable=True))
+    from sqlalchemy import inspect
+
+    bind = op.get_bind()
+    inspector = inspect(bind)
+    existing_cols = {c["name"] for c in inspector.get_columns("decision_log")}
+
+    new_cols = [
+        ("decision_score", sa.Float()),
+        ("validation_status", sa.String(length=32)),
+        ("risk_preference", sa.String(length=32)),
+        ("floor_projection", sa.Float()),
+        ("median_projection", sa.Float()),
+        ("ceiling_projection", sa.Float()),
+        ("projection_variance", sa.Float()),
+        ("explanation_summary", sa.Text()),
+        ("inputs_used_json", sa.Text()),
+        ("simulation_summary_json", sa.Text()),
+    ]
+    for col_name, col_type in new_cols:
+        if col_name not in existing_cols:
+            op.add_column("decision_log", sa.Column(col_name, col_type, nullable=True))
 
 
 def downgrade() -> None:
