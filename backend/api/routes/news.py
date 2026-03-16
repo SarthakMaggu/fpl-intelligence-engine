@@ -14,8 +14,6 @@ from loguru import logger
 
 router = APIRouter()
 
-API = "http://localhost:8000"
-
 
 @router.get("/articles")
 async def get_articles(limit: int = Query(40, le=200)):

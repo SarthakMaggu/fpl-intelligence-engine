@@ -14,10 +14,10 @@ class Settings(BaseSettings):
     BACKEND_PORT: int = 8000
     FRONTEND_URL: str = "http://localhost:3001"
     SECRET_KEY: str = "dev-secret-key-change-in-production"
-    PUBLIC_APP_URL: str = "http://localhost:3001"
+    PUBLIC_APP_URL: str = "http://localhost:8000"
     ADMIN_TOKEN: str = ""
 
-    # Database
+    # Database — Railway injects postgres:// which asyncpg needs as postgresql+asyncpg://
     DATABASE_URL: str = "postgresql+asyncpg://postgres:changeme@localhost:5433/fpl_intelligence"
     POSTGRES_PASSWORD: str = "changeme"
 
@@ -61,6 +61,27 @@ class Settings(BaseSettings):
     TWILIO_AUTH_TOKEN: str = ""
     TWILIO_WHATSAPP_FROM: str = "whatsapp:+14155238886"
     TWILIO_WHATSAPP_TO: str = ""
+
+    @property
+    def async_database_url(self) -> str:
+        """Return DATABASE_URL with the asyncpg driver.
+        Railway (and many hosts) inject a plain postgres:// URL — convert it."""
+        url = self.DATABASE_URL
+        if url.startswith("postgres://"):
+            url = "postgresql+asyncpg://" + url[len("postgres://"):]
+        elif url.startswith("postgresql://") and "+asyncpg" not in url:
+            url = "postgresql+asyncpg://" + url[len("postgresql://"):]
+        return url
+
+    @property
+    def cors_origins(self) -> list[str]:
+        """FRONTEND_URL may be comma-separated (e.g. Vercel + custom domain)."""
+        base = ["http://localhost:3001", "http://localhost:3000"]
+        for origin in self.FRONTEND_URL.split(","):
+            origin = origin.strip()
+            if origin and origin not in base:
+                base.append(origin)
+        return base
 
     @property
     def email_enabled(self) -> bool:

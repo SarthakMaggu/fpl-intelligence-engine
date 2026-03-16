@@ -508,11 +508,7 @@ async def request_context_middleware(request, call_next):
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3001", "http://localhost:3000",
-        # Production: read from env
-        *([o for o in [__import__("os").getenv("FRONTEND_URL")] if o]),
-    ],
+    allow_origins=settings.cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

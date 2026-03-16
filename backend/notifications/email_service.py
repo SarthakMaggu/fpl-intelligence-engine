@@ -320,12 +320,13 @@ class EmailService:
             chip_reason = chip.get("reasoning") or chip.get("rationale") or ""
             chip_html = f"""
         <div style="background:#fffbeb;border:1px solid #fbbf24;border-radius:8px;padding:16px;margin-bottom:20px;">
-          <h2 style="font-size:14px;color:#92400e;text-transform:uppercase;letter-spacing:1px;margin:0 0 8px;font-family:sans-serif;">⚡ Chip Recommendation</h2>
+          <h2 style="font-size:14px;color:#92400e;text-transform:uppercase;letter-spacing:1px;margin:0 0 8px;font-family:sans-serif;">Chip Recommendation</h2>
           <p style="margin:0;font-weight:600;color:#78350f;font-size:15px;font-family:sans-serif;">{chip_name}</p>
           {f'<p style="margin:6px 0 0;color:#92400e;font-size:13px;font-family:sans-serif;">{chip_reason[:200]}</p>' if chip_reason else ''}
         </div>"""
 
-        unsubscribe_url = f"http://localhost:8000/api/user/profile?team_id=0"  # placeholder
+        from core.config import settings
+        unsubscribe_url = f"{settings.PUBLIC_APP_URL}/api/user/profile?team_id=0"
 
         return f"""<!DOCTYPE html>
 <html lang="en">

@@ -799,7 +799,7 @@ async def _send_deadline_email_job(gw_id: int) -> None:
             import httpx
             async with httpx.AsyncClient(timeout=15.0) as client:
                 intel_r = await client.get(
-                    f"http://localhost:8000/api/intel/gw?team_id={settings.FPL_TEAM_ID}"
+                    f"{settings.PUBLIC_APP_URL}/api/intel/gw?team_id={settings.FPL_TEAM_ID}"
                 )
                 intel_data = intel_r.json() if intel_r.status_code == 200 else {}
         except Exception as intel_err:

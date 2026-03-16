@@ -1,0 +1,13 @@
+# This file is the Railway config for the background worker service.
+# In Railway dashboard: create a second service from the same repo,
+# point buildContext to "backend", and set the start command below.
+
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "backend/Dockerfile"
+buildContext = "backend"
+
+[deploy]
+startCommand = "alembic upgrade head && python worker.py"
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 3
