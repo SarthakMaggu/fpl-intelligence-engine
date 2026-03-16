@@ -27,11 +27,17 @@ from models.db.bandit import BanditDecision  # noqa: F401
 from models.db.feature_store import PlayerFeaturesLatest, PlayerFeaturesHistory  # noqa: F401
 from models.db.model_registry import ModelRegistry  # noqa: F401
 from models.db.backtest import BacktestModelMetrics, BacktestStrategyMetrics  # noqa: F401
-from models.db.calibration import PredictionCalibration  # noqa: F401
+from models.db.calibration import PredictionCalibration, PointsDistribution  # noqa: F401
 from models.db.background_job import BackgroundJob  # noqa: F401
 from models.db.competition_fixture import CompetitionFixture  # noqa: F401
 from models.db.historical_gw_stats import HistoricalGWStats  # noqa: F401
-from models.db.versioning import SchemaVersion  # noqa: F401
+from models.db.versioning import (  # noqa: F401
+    DataSnapshot,
+    FeatureVersion,
+    ModelVersion,
+    PredictionEvaluation,
+    FeatureDriftResult,
+)
 
 config = context.config
 
