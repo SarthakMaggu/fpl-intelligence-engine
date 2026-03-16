@@ -148,39 +148,51 @@ After adding the PostgreSQL and Redis plugins, Railway auto-creates:
 
 Your code handles all of these automatically. **You do not need to set `DATABASE_URL` or `REDIS_URL` manually.**
 
-**Set these environment variables** (Settings → Variables on the backend service):
+**Step 1 — Generate a secret key** (run this on your machine, copy the output):
 
-```env
-ENVIRONMENT=production
-SECRET_KEY=<run: openssl rand -hex 32>
-ADMIN_TOKEN=<strong random string — save this somewhere>
-PUBLIC_APP_URL=https://<your-railway-backend>.railway.app
-FRONTEND_URL=https://<your-app>.vercel.app
-FPL_TEAM_ID=<your FPL entry ID>
+```bash
+openssl rand -hex 32
 ```
 
-Optional but recommended:
-```env
-SENDGRID_API_KEY=<from sendgrid.com — free 100 emails/day>
-SENDGRID_FROM_EMAIL=<verified sender in SendGrid>
-ADMIN_ALERT_EMAIL=<your email — gets failure alerts>
-FOOTBALL_DATA_API_KEY=<free at football-data.org — enables UCL/FAC fixtures>
-```
+**Step 2 — Add these variables** in Railway → backend service → Variables → New Variable:
 
-- [ ] All required vars set (NOT `DATABASE_URL` or `REDIS_URL` — plugins handle those)
-- [ ] Railway redeploys after saving variables
+| Variable | Value | Notes |
+|---|---|---|
+| `ENVIRONMENT` | `production` | Required |
+| `SECRET_KEY` | _(output from openssl above)_ | Required — 64-char hex |
+| `ADMIN_TOKEN` | _(any strong password)_ | Required — save it |
+| `PUBLIC_APP_URL` | `https://<your-backend>.railway.app` | Fill in after first deploy |
+| `FRONTEND_URL` | `https://<your-app>.vercel.app` | Fill in after Vercel deploy |
+| `SENDGRID_API_KEY` | _(your SendGrid API key)_ | Email alerts — required for emails |
+| `SENDGRID_FROM_EMAIL` | _(e.g. fpl@yourdomain.com)_ | Must be verified sender in SendGrid |
+| `NOTIFICATION_TO_EMAIL` | _(your personal email)_ | Receives weekly FPL intel emails |
+| `ADMIN_ALERT_EMAIL` | _(your personal email)_ | Receives pipeline failure alerts |
+
+**DO NOT add these** — Railway injects them automatically from plugins:
+- `DATABASE_URL`, `PGHOST`, `PGPORT`, `PGUSER`, `PGPASSWORD`, `PGDATABASE` → from PostgreSQL plugin
+- `REDIS_URL`, `REDIS_PUBLIC_URL` → from Redis plugin
+
+**Skip entirely for MVP** (features auto-disable when keys are absent):
+- `REDDIT_CLIENT_ID` / `REDDIT_CLIENT_SECRET` → Reddit news disabled, no impact on core features
+- `TWILIO_*` → WhatsApp alerts disabled, no impact
+- `ODDS_API_KEY` → falls back to team-strength data automatically
+- `FOOTBALL_DATA_API_KEY` → UCL/FA Cup rotation risk disabled, no impact
+
+- [ ] All required vars set in Railway
+- [ ] Railway redeploys after saving variables (automatic)
 - [ ] Health check passes: `curl https://your-backend.railway.app/api/health`
 
-> **If the deploy hangs:** Railway sometimes needs a manual redeploy after adding plugins. Click "Redeploy" on the backend service.
+> **If the deploy hangs:** Click "Redeploy" on the backend service after adding plugins.
 
 ### B3. Deploy worker on Railway (background job processor)
 
 1. In the same Railway project → **+ New Service → GitHub Repo** → same repo
-2. Go to service **Settings → Deploy** and set the start command:
+2. When prompted for a config file, point it to `worker.railway.toml` (or Railway auto-detects it)
+3. The worker start command is already set in `worker.railway.toml`:
    ```
-   alembic upgrade head && python worker.py
+   WORKER=true /app/entrypoint.sh
    ```
-3. Copy ALL the same environment variables from the backend service to this worker service
+4. Copy ALL the same environment variables from the backend service to this worker service
 4. Deploy
 
 - [ ] Worker service shows "Active" (it runs continuously — no health check endpoint)
@@ -391,7 +403,9 @@ curl $BACKEND/api/lab/performance-summary
 | Symptom | Likely cause | Fix |
 |---------|-------------|-----|
 | `Connection refused to localhost:5433` in Railway deploy log | PostgreSQL plugin not attached | Railway → your project → **+ New** → **Database** → **Add PostgreSQL** → Redeploy |
-| Still getting localhost:5433 after adding plugin | You clicked "Import variables from source code" which set `DATABASE_URL` to the localhost default, overriding the plugin | Variables tab → delete the `DATABASE_URL` row (the one with `localhost`) → Redeploy. Plugin provides it automatically via `DATABASE_PUBLIC_URL` |
+| Still getting localhost:5433 after adding plugin | You clicked "Import variables from source code" which set `DATABASE_URL` to the localhost default, overriding the plugin | Variables tab → delete the `DATABASE_URL` row (the one with `localhost`) → Redeploy. Plugin provides it automatically via `PGHOST` |
+| `relation "predictions" does not exist` in alembic log | Migration 0001 tried to ALTER a table before it existed | Fixed in code — migration now uses `create_all(checkfirst=True)`. Just Redeploy. |
+| `column "decision_score" already exists` in alembic log | Migration 0002 ran on a DB where columns were already created by 0001 | Fixed in code — migration checks column existence before adding. Just Redeploy. |
 | `Can't connect to Redis` / Redis errors on startup | Redis plugin not attached | Railway → **+ New** → **Database** → **Add Redis** → Redeploy |
 | CORS error in browser | `FRONTEND_URL` on Railway doesn't match Vercel URL | Update `FRONTEND_URL` on Railway → Redeploy |
 | `has_data: false` on landing strip | DB seeded but not seen yet | `curl -X POST $BACKEND/api/lab/reseed -H "X-Admin-Token: $TOKEN"` |
