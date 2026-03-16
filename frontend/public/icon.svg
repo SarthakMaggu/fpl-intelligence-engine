@@ -1,0 +1,36 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
+  <defs>
+    <radialGradient id="bg" cx="50%" cy="38%" r="70%">
+      <stop offset="0%" stop-color="#1A2A1A"/>
+      <stop offset="100%" stop-color="#080C08"/>
+    </radialGradient>
+    <radialGradient id="glow" cx="50%" cy="60%" r="55%">
+      <stop offset="0%" stop-color="#22C55E" stop-opacity="0.45"/>
+      <stop offset="100%" stop-color="#22C55E" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+  <!-- Background -->
+  <rect width="32" height="32" rx="7" fill="url(#bg)"/>
+  <!-- Pitch glow blob -->
+  <ellipse cx="16" cy="20" rx="12" ry="9" fill="url(#glow)"/>
+  <!-- Pitch fill (dark green) -->
+  <rect x="4.5" y="6.5" width="23" height="19" rx="1.5" fill="#0D1F0D"/>
+  <!-- Grass stripe bands -->
+  <rect x="4.5" y="9.5" width="23" height="3" fill="#0F220F"/>
+  <rect x="4.5" y="15.5" width="23" height="3" fill="#0F220F"/>
+  <rect x="4.5" y="21.5" width="23" height="4" fill="#0F220F"/>
+  <!-- Pitch border — bright white-green -->
+  <rect x="4.5" y="6.5" width="23" height="19" rx="1.5" stroke="#22C55E" stroke-width="1.4" fill="none" stroke-opacity="0.95"/>
+  <!-- Halfway line -->
+  <line x1="16" y1="6.5" x2="16" y2="25.5" stroke="#22C55E" stroke-width="0.9" stroke-opacity="0.6"/>
+  <!-- Center circle -->
+  <circle cx="16" cy="16" r="4" stroke="#22C55E" stroke-width="0.9" fill="none" stroke-opacity="0.6"/>
+  <!-- Penalty boxes -->
+  <rect x="4.5" y="11" width="5" height="10" rx="0.5" stroke="#22C55E" stroke-width="0.8" fill="none" stroke-opacity="0.5"/>
+  <rect x="22.5" y="11" width="5" height="10" rx="0.5" stroke="#22C55E" stroke-width="0.8" fill="none" stroke-opacity="0.5"/>
+  <!-- Center spot — anchor -->
+  <circle cx="16" cy="16" r="1.6" fill="#22C55E"/>
+  <!-- Penalty spots -->
+  <circle cx="8.5" cy="16" r="0.8" fill="#22C55E" opacity="0.75"/>
+  <circle cx="23.5" cy="16" r="0.8" fill="#22C55E" opacity="0.75"/>
+</svg>
