@@ -3,7 +3,7 @@ from redis.asyncio import Redis
 from core.config import settings
 
 redis_client: Redis = Redis.from_url(
-    settings.REDIS_URL,
+    settings.redis_url,
     decode_responses=True,
     encoding="utf-8",
 )

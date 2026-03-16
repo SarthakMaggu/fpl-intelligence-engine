@@ -100,19 +100,19 @@ class Settings(BaseSettings):
         """asyncpg URL for SQLAlchemy async engine.
 
         Resolution order:
-          1. PGHOST/PGPORT/PGUSER/PGPASSWORD/PGDATABASE (Railway plugin vars —
-             immune to manual DATABASE_URL overrides in Railway Variables tab)
-          2. DATABASE_URL env var (correctly set by plugin or docker-compose)
-          3. self.DATABASE_URL pydantic default (local dev fallback)
+          1. PGHOST/PGPORT/PGUSER/PGPASSWORD/PGDATABASE  (Railway plugin vars)
+          2. DATABASE_URL / DATABASE_PRIVATE_URL           (internal Railway URL)
+          3. DATABASE_PUBLIC_URL                           (Railway public URL fallback)
+          4. self.DATABASE_URL pydantic default            (local dev fallback)
         """
         import os
-        return (
-            self._pg_url("asyncpg")
-            or self._normalise_url(
-                os.environ.get("DATABASE_URL") or os.environ.get("DATABASE_PRIVATE_URL") or self.DATABASE_URL,
-                "asyncpg",
-            )
+        raw = (
+            os.environ.get("DATABASE_URL")
+            or os.environ.get("DATABASE_PRIVATE_URL")
+            or os.environ.get("DATABASE_PUBLIC_URL")
+            or self.DATABASE_URL
         )
+        return self._pg_url("asyncpg") or self._normalise_url(raw, "asyncpg")
 
     @property
     def sync_database_url(self) -> str:
@@ -121,12 +121,22 @@ class Settings(BaseSettings):
         Same resolution order as async_database_url.
         """
         import os
+        raw = (
+            os.environ.get("DATABASE_URL")
+            or os.environ.get("DATABASE_PRIVATE_URL")
+            or os.environ.get("DATABASE_PUBLIC_URL")
+            or self.DATABASE_URL
+        )
+        return self._pg_url("psycopg2") or self._normalise_url(raw, "psycopg2")
+
+    @property
+    def redis_url(self) -> str:
+        """Redis URL — falls back to REDIS_PUBLIC_URL if REDIS_URL is absent."""
+        import os
         return (
-            self._pg_url("psycopg2")
-            or self._normalise_url(
-                os.environ.get("DATABASE_URL") or os.environ.get("DATABASE_PRIVATE_URL") or self.DATABASE_URL,
-                "psycopg2",
-            )
+            os.environ.get("REDIS_URL")
+            or os.environ.get("REDIS_PUBLIC_URL")
+            or self.REDIS_URL
         )
 
     @property

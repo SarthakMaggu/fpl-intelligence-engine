@@ -20,11 +20,16 @@ if [ -n "$PGHOST" ] && [ "$PGHOST" != "localhost" ] && [ "$PGHOST" != "127.0.0.1
     DB_HOST="$PGHOST"
     DB_PORT="${PGPORT:-5432}"
     echo "[db] Host from PGHOST: $DB_HOST:$DB_PORT"
-elif [ -n "$DATABASE_URL" ] || [ -n "$DATABASE_PRIVATE_URL" ]; then
-    # Parse host and port from the URL using Python (psycopg2 already installed)
+elif [ -n "$DATABASE_URL" ] || [ -n "$DATABASE_PRIVATE_URL" ] || [ -n "$DATABASE_PUBLIC_URL" ]; then
+    # Parse host and port from the URL using Python (handles all Railway URL variants)
     eval $(python3 - << 'PYEOF'
 import re, os
-url = os.environ.get("DATABASE_URL") or os.environ.get("DATABASE_PRIVATE_URL") or ""
+url = (
+    os.environ.get("DATABASE_URL")
+    or os.environ.get("DATABASE_PRIVATE_URL")
+    or os.environ.get("DATABASE_PUBLIC_URL")
+    or ""
+)
 m = re.search(r'@([^:/@]+)(?::(\d+))?/', url)
 if m:
     host = m.group(1)

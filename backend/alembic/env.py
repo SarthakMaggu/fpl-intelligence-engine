@@ -75,10 +75,12 @@ def _build_sync_url() -> str:
         pg_db   = os.environ.get("PGDATABASE", "railway")
         return f"postgresql+psycopg2://{pg_user}:{pg_pass}@{pg_host}:{pg_port}/{pg_db}"
 
-    # Step 2: full URL env var (docker-compose or correctly configured Railway)
+    # Step 2: full URL env var (docker-compose or Railway)
+    # DATABASE_PUBLIC_URL is Railway's public connection string — last resort
     raw = (
         os.environ.get("DATABASE_URL")
         or os.environ.get("DATABASE_PRIVATE_URL")
+        or os.environ.get("DATABASE_PUBLIC_URL")
         or settings.DATABASE_URL
     )
 

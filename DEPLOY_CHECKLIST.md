@@ -136,12 +136,19 @@ This gives you `https://your-app.vercel.app` — a public URL you can share with
 
 > **DO NOT click "Import variables from source code"** if Railway shows that prompt.
 > It will copy `DATABASE_URL=postgresql+asyncpg://...localhost:5433...` from
-> `.env.example` into your Variables, overriding the real database URL injected
-> by the plugin. If you already did this, go to **Settings → Variables**, delete
-> the manually-set `DATABASE_URL` row, and click **Redeploy**.
-> The plugin injects `DATABASE_URL` automatically — you do not need to set it manually.
+> `.env.example` into your Variables, breaking the connection. If you already did this,
+> delete the manually-set `DATABASE_URL` and `REDIS_URL` rows, then Redeploy.
 
-**Set environment variables** (Settings → Variables on the backend service):
+**Understanding Railway's variable names:**
+
+After adding the PostgreSQL and Redis plugins, Railway auto-creates:
+- `DATABASE_PUBLIC_URL` — external connection string (your code reads this automatically)
+- `REDIS_PUBLIC_URL` — external Redis URL (your code reads this automatically)
+- `PGHOST`, `PGPORT`, `PGUSER`, `PGPASSWORD`, `PGDATABASE` — individual DB vars
+
+Your code handles all of these automatically. **You do not need to set `DATABASE_URL` or `REDIS_URL` manually.**
+
+**Set these environment variables** (Settings → Variables on the backend service):
 
 ```env
 ENVIRONMENT=production
@@ -160,7 +167,7 @@ ADMIN_ALERT_EMAIL=<your email — gets failure alerts>
 FOOTBALL_DATA_API_KEY=<free at football-data.org — enables UCL/FAC fixtures>
 ```
 
-- [ ] All required vars set
+- [ ] All required vars set (NOT `DATABASE_URL` or `REDIS_URL` — plugins handle those)
 - [ ] Railway redeploys after saving variables
 - [ ] Health check passes: `curl https://your-backend.railway.app/api/health`
 
@@ -383,9 +390,9 @@ curl $BACKEND/api/lab/performance-summary
 
 | Symptom | Likely cause | Fix |
 |---------|-------------|-----|
-| `Connection refused to localhost:5433` in Railway deploy log | Either: (a) PostgreSQL plugin not attached, or (b) you clicked "Import variables from source code" which set `DATABASE_URL` to the localhost default | (a) Add PostgreSQL plugin → Redeploy. (b) Go to Variables → delete the manually-set `DATABASE_URL` row → Redeploy. The plugin provides it automatically. |
-| Same error after adding plugin | Plugin added but manually-imported `DATABASE_URL=localhost:5433` variable still overrides it | Variables tab → delete the `DATABASE_URL` row with the localhost value → Redeploy |
-| `Can't connect to Redis` / Redis errors on startup | Redis plugin not attached | Railway → Add Plugin → Redis → Redeploy |
+| `Connection refused to localhost:5433` in Railway deploy log | PostgreSQL plugin not attached | Railway → your project → **+ New** → **Database** → **Add PostgreSQL** → Redeploy |
+| Still getting localhost:5433 after adding plugin | You clicked "Import variables from source code" which set `DATABASE_URL` to the localhost default, overriding the plugin | Variables tab → delete the `DATABASE_URL` row (the one with `localhost`) → Redeploy. Plugin provides it automatically via `DATABASE_PUBLIC_URL` |
+| `Can't connect to Redis` / Redis errors on startup | Redis plugin not attached | Railway → **+ New** → **Database** → **Add Redis** → Redeploy |
 | CORS error in browser | `FRONTEND_URL` on Railway doesn't match Vercel URL | Update `FRONTEND_URL` on Railway → Redeploy |
 | `has_data: false` on landing strip | DB seeded but not seen yet | `curl -X POST $BACKEND/api/lab/reseed -H "X-Admin-Token: $TOKEN"` |
 | Frontend can't reach backend | Wrong `NEXT_PUBLIC_API_URL` in Vercel env vars | Update in Vercel → Settings → Environment Variables → redeploy |
