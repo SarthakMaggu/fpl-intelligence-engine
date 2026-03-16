@@ -49,19 +49,33 @@ target_metadata = Base.metadata
 
 def _build_sync_url() -> str:
     """
-    Build a synchronous psycopg2 URL for Alembic.
+    Build a synchronous psycopg2 URL for Alembic migrations.
 
-    Handles every URL scheme that Railway, Docker Compose, or a .env might inject:
-      postgres://...            → postgresql+psycopg2://...  (Railway plugin default)
-      postgresql://...          → postgresql+psycopg2://...
-      postgresql+asyncpg://...  → postgresql+psycopg2://...  (.env.example default)
-      postgresql+psycopg2://... → unchanged (already correct)
+    Resolution order — most reliable first:
 
-    Priority:
-      1. DATABASE_URL environment variable  (Railway injects this)
-      2. DATABASE_PRIVATE_URL               (Railway private networking fallback)
-      3. settings.DATABASE_URL              (pydantic-settings / .env file fallback)
+    1. PGHOST/PGPORT/PGUSER/PGPASSWORD/PGDATABASE
+       Railway's PostgreSQL plugin injects these individually.
+       They are PLUGIN variables — they cannot be overridden by a user
+       clicking "Import variables from source code" in Railway's UI,
+       which is the most common cause of DATABASE_URL being set to
+       a localhost value that breaks migrations on Railway.
+
+    2. DATABASE_URL / DATABASE_PRIVATE_URL env var
+       Used when PGHOST is absent or is localhost (local Docker Compose).
+
+    3. settings.DATABASE_URL
+       Pydantic default — local development fallback only.
     """
+    # Step 1: individual PG* vars (Railway plugin — cannot be user-overridden)
+    pg_host = os.environ.get("PGHOST", "")
+    if pg_host and pg_host not in ("localhost", "127.0.0.1"):
+        pg_port = os.environ.get("PGPORT", "5432")
+        pg_user = os.environ.get("PGUSER", "postgres")
+        pg_pass = os.environ.get("PGPASSWORD", "")
+        pg_db   = os.environ.get("PGDATABASE", "railway")
+        return f"postgresql+psycopg2://{pg_user}:{pg_pass}@{pg_host}:{pg_port}/{pg_db}"
+
+    # Step 2: full URL env var (docker-compose or correctly configured Railway)
     raw = (
         os.environ.get("DATABASE_URL")
         or os.environ.get("DATABASE_PRIVATE_URL")
@@ -72,8 +86,7 @@ def _build_sync_url() -> str:
         if raw.startswith(prefix):
             return "postgresql+psycopg2://" + raw[len(prefix):]
 
-    # Already postgresql+psycopg2:// or unrecognised — return unchanged
-    return raw
+    return raw  # already postgresql+psycopg2:// or unrecognised
 
 
 config.set_main_option("sqlalchemy.url", _build_sync_url())

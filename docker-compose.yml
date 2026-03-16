@@ -37,6 +37,13 @@ services:
       - path: .env
         required: false
     environment:
+      # PG* vars — same names Railway plugin injects; code reads these first
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGUSER: postgres
+      PGPASSWORD: ${POSTGRES_PASSWORD:-changeme}
+      PGDATABASE: fpl_intelligence
+      # DATABASE_URL kept for compatibility
       DATABASE_URL: postgresql+asyncpg://postgres:${POSTGRES_PASSWORD:-changeme}@postgres:5432/fpl_intelligence
       REDIS_URL: redis://redis:6379/0
       FRONTEND_URL: http://localhost:3001
@@ -60,6 +67,11 @@ services:
       - path: .env
         required: false
     environment:
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGUSER: postgres
+      PGPASSWORD: ${POSTGRES_PASSWORD:-changeme}
+      PGDATABASE: fpl_intelligence
       DATABASE_URL: postgresql+asyncpg://postgres:${POSTGRES_PASSWORD:-changeme}@postgres:5432/fpl_intelligence
       REDIS_URL: redis://redis:6379/0
     depends_on:

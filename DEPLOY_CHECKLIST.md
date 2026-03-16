@@ -124,21 +124,22 @@ This gives you `https://your-app.vercel.app` — a public URL you can share with
 
 ### B2. Deploy backend on Railway
 
-> **CRITICAL — do steps 1–4 in this exact order before the first deploy succeeds.**
-> If you deploy before adding the PostgreSQL and Redis plugins, Alembic will fail
-> with "Connection refused to localhost:5433" because `DATABASE_URL` won't be set yet.
-> If this already happened, just add both plugins then click **Redeploy**.
-
 1. Railway dashboard → **New Project → Deploy from GitHub repo**
 2. Select `SarthakMaggu/fpl-intelligence-engine`
-3. **Before the build finishes**, click **Add Plugin → PostgreSQL** (Railway managed)
-4. **Before the build finishes**, click **Add Plugin → Redis** (Railway managed)
-   - Both plugins inject `DATABASE_URL` and `REDIS_URL` into your service automatically
+3. Click **Add Plugin → PostgreSQL** (Railway managed Postgres)
+4. Click **Add Plugin → Redis** (Railway managed Redis)
 5. Railway detects `railway.toml` and builds `backend/Dockerfile`
 
 - [ ] PostgreSQL plugin connected (shows green)
 - [ ] Redis plugin connected (shows green)
 - [ ] Build succeeds (green in Railway deploy log)
+
+> **DO NOT click "Import variables from source code"** if Railway shows that prompt.
+> It will copy `DATABASE_URL=postgresql+asyncpg://...localhost:5433...` from
+> `.env.example` into your Variables, overriding the real database URL injected
+> by the plugin. If you already did this, go to **Settings → Variables**, delete
+> the manually-set `DATABASE_URL` row, and click **Redeploy**.
+> The plugin injects `DATABASE_URL` automatically — you do not need to set it manually.
 
 **Set environment variables** (Settings → Variables on the backend service):
 
@@ -382,8 +383,8 @@ curl $BACKEND/api/lab/performance-summary
 
 | Symptom | Likely cause | Fix |
 |---------|-------------|-----|
-| `Connection refused to localhost:5433` in Railway deploy log | PostgreSQL plugin not attached — `DATABASE_URL` was never injected, so Alembic fell back to the local default | Railway → your backend service → **Add Plugin → PostgreSQL** → then click **Redeploy** |
-| Same error even after adding plugin | Plugin was added AFTER the first deploy — env var wasn't visible to that build | Click **Redeploy** on the backend service |
+| `Connection refused to localhost:5433` in Railway deploy log | Either: (a) PostgreSQL plugin not attached, or (b) you clicked "Import variables from source code" which set `DATABASE_URL` to the localhost default | (a) Add PostgreSQL plugin → Redeploy. (b) Go to Variables → delete the manually-set `DATABASE_URL` row → Redeploy. The plugin provides it automatically. |
+| Same error after adding plugin | Plugin added but manually-imported `DATABASE_URL=localhost:5433` variable still overrides it | Variables tab → delete the `DATABASE_URL` row with the localhost value → Redeploy |
 | `Can't connect to Redis` / Redis errors on startup | Redis plugin not attached | Railway → Add Plugin → Redis → Redeploy |
 | CORS error in browser | `FRONTEND_URL` on Railway doesn't match Vercel URL | Update `FRONTEND_URL` on Railway → Redeploy |
 | `has_data: false` on landing strip | DB seeded but not seen yet | `curl -X POST $BACKEND/api/lab/reseed -H "X-Admin-Token: $TOKEN"` |

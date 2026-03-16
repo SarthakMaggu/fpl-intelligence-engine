@@ -63,24 +63,71 @@ class Settings(BaseSettings):
     TWILIO_WHATSAPP_TO: str = ""
 
     @staticmethod
+    def _pg_url(driver: str) -> str | None:
+        """
+        Build a database URL from individual PG* environment variables.
+
+        Railway's PostgreSQL plugin injects PGHOST, PGPORT, PGUSER, PGPASSWORD,
+        PGDATABASE individually. These are plugin-level variables — they are
+        injected by the plugin and CANNOT be overridden by a user manually
+        importing variables from source code (which is a common mistake that
+        overwrites DATABASE_URL with a localhost value).
+
+        Returns None if PGHOST is absent (local dev without PG* vars).
+        """
+        import os
+        host = os.environ.get("PGHOST", "")
+        # Ignore if host is localhost/127.0.0.1 — that means we're in local Docker
+        # where DATABASE_URL is the reliable value instead.
+        if not host or host in ("localhost", "127.0.0.1"):
+            return None
+        port = os.environ.get("PGPORT", "5432")
+        user = os.environ.get("PGUSER", "postgres")
+        password = os.environ.get("PGPASSWORD", "")
+        dbname = os.environ.get("PGDATABASE", "railway")
+        return f"postgresql+{driver}://{user}:{password}@{host}:{port}/{dbname}"
+
+    @staticmethod
     def _normalise_url(raw: str, driver: str) -> str:
-        """Replace any postgres:// scheme variant with the given driver."""
+        """Swap any postgres:// scheme variant to the requested driver."""
         for prefix in ("postgres://", "postgresql://", "postgresql+asyncpg://", "postgresql+psycopg2://"):
             if raw.startswith(prefix):
                 return f"postgresql+{driver}://" + raw[len(prefix):]
-        return raw  # already has correct prefix or unrecognised
+        return raw  # already correct or unrecognised scheme
 
     @property
     def async_database_url(self) -> str:
-        """asyncpg URL — used by SQLAlchemy async engine (FastAPI app).
-        Handles postgres://, postgresql://, or postgresql+asyncpg:// input."""
-        return self._normalise_url(self.DATABASE_URL, "asyncpg")
+        """asyncpg URL for SQLAlchemy async engine.
+
+        Resolution order:
+          1. PGHOST/PGPORT/PGUSER/PGPASSWORD/PGDATABASE (Railway plugin vars —
+             immune to manual DATABASE_URL overrides in Railway Variables tab)
+          2. DATABASE_URL env var (correctly set by plugin or docker-compose)
+          3. self.DATABASE_URL pydantic default (local dev fallback)
+        """
+        import os
+        return (
+            self._pg_url("asyncpg")
+            or self._normalise_url(
+                os.environ.get("DATABASE_URL") or os.environ.get("DATABASE_PRIVATE_URL") or self.DATABASE_URL,
+                "asyncpg",
+            )
+        )
 
     @property
     def sync_database_url(self) -> str:
-        """psycopg2 URL — used by Alembic migrations (sync driver).
-        Handles postgres://, postgresql://, or postgresql+asyncpg:// input."""
-        return self._normalise_url(self.DATABASE_URL, "psycopg2")
+        """psycopg2 URL for Alembic migrations (sync driver).
+
+        Same resolution order as async_database_url.
+        """
+        import os
+        return (
+            self._pg_url("psycopg2")
+            or self._normalise_url(
+                os.environ.get("DATABASE_URL") or os.environ.get("DATABASE_PRIVATE_URL") or self.DATABASE_URL,
+                "psycopg2",
+            )
+        )
 
     @property
     def cors_origins(self) -> list[str]:
