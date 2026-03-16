@@ -20,6 +20,12 @@ def upgrade() -> None:
 
     bind = op.get_bind()
     inspector = inspect(bind)
+
+    # If the table doesn't exist at all, create_all in 0001 should have made it.
+    # Guard here so we never crash on a missing table.
+    if "decision_log" not in inspector.get_table_names():
+        return
+
     existing_cols = {c["name"] for c in inspector.get_columns("decision_log")}
 
     new_cols = [
