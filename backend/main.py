@@ -240,6 +240,12 @@ async def lifespan(app: FastAPI):
     # 5c. Seed competition fixtures on startup (non-blocking, fast for PL-only)
     asyncio.create_task(_seed_competition_fixtures())
 
+    # 5d. Sync live gameweek state from FPL API (single bootstrap call ~200ms).
+    # Ensures is_current / is_next / finished flags are always fresh on every
+    # startup — not just after the Tuesday pipeline.  Without this, the app
+    # shows a stale "current" GW until the next scheduled full pipeline run.
+    asyncio.create_task(_sync_gameweek_state(fetcher))
+
     # 5b. Start Redis pub/sub listener (WebSocket fan-out)
     pubsub_task = asyncio.create_task(start_pubsub_listener(ws_manager))
 
@@ -445,6 +451,29 @@ async def _auto_trigger_historical_backfill_if_needed(http_client) -> None:
             await redis_client.delete(_LOCK_KEY)
         except Exception:
             pass
+
+
+async def _sync_gameweek_state(fetcher) -> None:
+    """
+    Background startup task — fetch the FPL bootstrap-static once and
+    upsert all 38 gameweeks so is_current / is_next / finished are live.
+
+    This is a single cheap HTTP call (~200ms) and runs every startup.
+    It fixes the issue where the app shows a stale GW after deploy because
+    the full Tuesday pipeline hasn't run yet.
+    """
+    import asyncio
+    await asyncio.sleep(5)  # let DB settle first
+
+    try:
+        from agents.fpl_agent import FPLAgent
+
+        client = fetcher._get_client()
+        bootstrap = await FPLAgent(client).get_bootstrap()
+        count = await fetcher.processor.upsert_gameweeks(bootstrap)
+        logger.info(f"[startup] Gameweek state synced from FPL API ({count} GWs)")
+    except Exception as e:
+        logger.warning(f"[startup] Gameweek sync failed (non-fatal): {e}")
 
 
 async def _seed_competition_fixtures() -> None:

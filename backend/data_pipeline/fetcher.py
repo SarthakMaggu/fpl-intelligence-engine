@@ -317,7 +317,9 @@ class DataFetcher:
         return summary
 
     async def run_news_only_pipeline(self) -> dict:
-        """Lightweight daily news scrape (no full bootstrap needed)."""
+        """Lightweight daily news scrape. Also updates gameweek flags so
+        is_current / is_next / finished stay accurate every day, not just
+        on the weekly Tuesday full pipeline."""
         lock_acquired = await acquire_lock("fpl:news:lock", 120)
         if not lock_acquired:
             return {"status": "already_running"}
@@ -326,8 +328,11 @@ class DataFetcher:
             client = self._get_client()
             fpl_agent = FPLAgent(client)
             bootstrap = await fpl_agent.get_bootstrap()
-            player_names = [e.get("web_name", "") for e in bootstrap.get("elements", [])]
 
+            # Keep GW state fresh daily — single bootstrap already fetched above.
+            await self.processor.upsert_gameweeks(bootstrap)
+
+            player_names = [e.get("web_name", "") for e in bootstrap.get("elements", [])]
             news_agent = NewsAgent()
             alerts = await news_agent.run(player_names)
             return {"status": "complete", "alerts": len(alerts)}
