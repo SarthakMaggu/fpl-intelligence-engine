@@ -438,6 +438,20 @@ async def _run_full_pipeline() -> None:
         if _fetcher:
             result = await _fetcher.run_full_pipeline()
             logger.info(f"Weekly pipeline complete: {result.get('status')}")
+            # Record the GW this pipeline ran for so the startup auto-pipeline
+            # check knows not to re-run it on the next restart.
+            try:
+                from core.redis_client import redis_client as _rc
+                from core.database import AsyncSessionLocal as _Sess
+                from models.db.gameweek import Gameweek as _GW
+                from sqlalchemy import select as _sel
+                async with _Sess() as _db:
+                    _res = await _db.execute(_sel(_GW).where(_GW.is_current == True))
+                    _gw = _res.scalar_one_or_none()
+                if _gw:
+                    await _rc.set("pipeline:last_gw_run", str(_gw.id))
+            except Exception:
+                pass
     except Exception as e:
         logger.error(f"Weekly pipeline failed: {e}")
         await _send_admin_alert_safe(

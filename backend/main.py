@@ -246,6 +246,11 @@ async def lifespan(app: FastAPI):
     # shows a stale "current" GW until the next scheduled full pipeline run.
     asyncio.create_task(_sync_gameweek_state(fetcher))
 
+    # 5e. Auto-trigger full pipeline if GW has changed since last run.
+    # Covers the window between a GW ending and the Tuesday noon scheduler job.
+    # Runs in background — does not block startup.
+    asyncio.create_task(_auto_pipeline_on_gw_change(fetcher))
+
     # 5b. Start Redis pub/sub listener (WebSocket fan-out)
     pubsub_task = asyncio.create_task(start_pubsub_listener(ws_manager))
 
@@ -418,15 +423,30 @@ async def _auto_trigger_historical_backfill_if_needed(http_client) -> None:
         async with AsyncSessionLocal() as db:
             count = await db.scalar(select(func.count()).select_from(BacktestModelMetrics)) or 0
 
-        if count > 0:
+        # Check if the ML model artifact actually exists on disk.
+        # The synthetic seed populates backtest_model_metrics with 114 rows of
+        # fake data, so count > 0 is NOT sufficient to skip training — the model
+        # file would still be missing. We must also verify the artifact exists.
+        from pathlib import Path as _Path
+        _MODEL_PATH = _Path("/app/models/ml/artifacts/xpts_lgbm.pkl")
+        model_trained = _MODEL_PATH.exists()
+
+        if count > 0 and model_trained:
             logger.info(
-                f"Historical backfill skipped — {count} rows already in backtest_model_metrics"
+                f"Historical backfill skipped — {count} backtest rows exist and "
+                f"model artifact is present at {_MODEL_PATH}"
             )
             try:
                 await redis_client.delete(_LOCK_KEY)
             except Exception:
                 pass
             return
+
+        if count > 0 and not model_trained:
+            logger.info(
+                f"Backtest metrics exist ({count} rows) but ML model artifact is MISSING "
+                f"— running historical backfill to train the model."
+            )
 
         logger.info(
             "backtest_model_metrics is empty — triggering full historical backfill "
@@ -451,6 +471,56 @@ async def _auto_trigger_historical_backfill_if_needed(http_client) -> None:
             await redis_client.delete(_LOCK_KEY)
         except Exception:
             pass
+
+
+async def _auto_pipeline_on_gw_change(fetcher) -> None:
+    """
+    Background startup task — runs the full data pipeline if the current
+    gameweek has advanced since the last pipeline run.
+
+    This covers the gap between a GW ending and the Tuesday 12:00 scheduled
+    full pipeline:  any deploy or restart in that window will now auto-fetch
+    GW fixtures, player data, blank/double flags, and ML predictions so the
+    app is never stale after a GW transition.
+
+    Redis key: pipeline:last_gw_run (int, GW id of last successful pipeline)
+    """
+    import asyncio
+    await asyncio.sleep(20)  # let gameweek sync (task 5d) complete first
+
+    try:
+        from sqlalchemy import select as _select
+        from models.db.gameweek import Gameweek as _GW
+        from core.database import AsyncSessionLocal as _Session
+
+        async with _Session() as db:
+            res = await db.execute(_select(_GW).where(_GW.is_current == True))
+            current_gw = res.scalar_one_or_none()
+
+        if not current_gw:
+            return
+
+        last_run_gw_raw = await redis_client.get("pipeline:last_gw_run")
+        last_run_gw = int(last_run_gw_raw) if last_run_gw_raw else 0
+
+        if last_run_gw >= current_gw.id:
+            logger.info(
+                f"[startup] Pipeline up to date — last run GW{last_run_gw}, "
+                f"current GW{current_gw.id}"
+            )
+            return
+
+        logger.info(
+            f"[startup] GW changed since last pipeline run "
+            f"(last GW{last_run_gw} → current GW{current_gw.id}). "
+            f"Auto-triggering full pipeline to refresh fixtures, players, and predictions."
+        )
+        await fetcher.run_full_pipeline(team_id=None)
+        await redis_client.set("pipeline:last_gw_run", str(current_gw.id))
+        logger.info(f"[startup] Auto-pipeline complete for GW{current_gw.id}")
+
+    except Exception as e:
+        logger.warning(f"[startup] Auto-pipeline on GW change failed (non-fatal): {e}")
 
 
 async def _sync_gameweek_state(fetcher) -> None:
