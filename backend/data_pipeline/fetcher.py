@@ -232,7 +232,6 @@ class DataFetcher:
                 try:
                     from models.db.user_squad import UserSquad
                     from sqlalchemy import select
-                    from core.database import AsyncSessionLocal
                     async with AsyncSessionLocal() as db:
                         result = await db.execute(
                             select(UserSquad.player_id).where(
@@ -544,7 +543,6 @@ class DataFetcher:
         price_directions, price_confidence = self.price_model.predict(df)
 
         # Step 4: Update DB
-        from core.database import AsyncSessionLocal
         from models.db.player import Player
         from sqlalchemy import select
 

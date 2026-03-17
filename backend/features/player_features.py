@@ -76,8 +76,18 @@ async def build_features_for_gw(
             "transfers_in_event_delta": float(p.transfers_in_event or 0),
             "suspension_risk": float(p.suspension_risk or 0.0),
             "rotation_risk": 0.0,
-            "injury_risk": 1.0 - float((p.chance_of_playing_next_round or 100) / 100.0),
-            "availability_probability": float((p.chance_of_playing_next_round or 100) / 100.0),
+            # Explicit None check: `(0 or 100)` = 100 in Python, treating 0%-fit
+            # player as fully available — wrong. None means unknown → assume fit (1.0).
+            "availability_probability": float(
+                p.chance_of_playing_next_round / 100.0
+                if p.chance_of_playing_next_round is not None
+                else 1.0
+            ),
+            "injury_risk": 1.0 - float(
+                p.chance_of_playing_next_round / 100.0
+                if p.chance_of_playing_next_round is not None
+                else 1.0
+            ),
             "expected_minutes": float(p.predicted_start_prob or 0.0) * 75.0,
             # Blank/DGW flags (set elsewhere in pipeline, default 0)
             "blank_gw": 0,

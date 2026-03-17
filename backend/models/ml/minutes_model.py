@@ -179,7 +179,11 @@ class MinutesModel:
         min60_probs = np.full(n, 0.55)
 
         for i, (_, row) in enumerate(df.iterrows()):
-            cop = float(row.get("chance_of_playing", 1.0) or 1.0)
+            # Explicitly check for None vs 0 before applying `or` fallback.
+            # `0 or 1.0` evaluates to 1.0 in Python, which would treat an
+            # injured player (cop=0) as 100% likely to play — BUG.
+            cop_raw = row.get("chance_of_playing")
+            cop = float(cop_raw) if cop_raw is not None else 1.0
             status = row.get("status", "a")
             price = float(row.get("price_millions", 5.0) or 5.0)
             rotation_risk = float(row.get("rotation_risk_score", 0) or 0)

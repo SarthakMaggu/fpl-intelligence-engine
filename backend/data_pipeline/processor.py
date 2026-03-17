@@ -211,7 +211,10 @@ class DataProcessor:
                 gw_teams[gw_id].append((team_id, count))
 
             for gw_id, team_counts in gw_teams.items():
-                has_blank = any(c == 0 for _, c in team_counts) or len(team_counts) < 20
+                # A GW is blank if fewer than 20 teams appear in the fixture list
+                # (teams with 0 fixtures are simply absent from fixture_counts, not
+                # stored as count=0 — the SQL only returns rows that exist).
+                has_blank = len(team_counts) < 20
                 has_double = any(c >= 2 for _, c in team_counts)
 
                 gw = await db.get(Gameweek, gw_id)
@@ -236,7 +239,10 @@ class DataProcessor:
 
             if next_gw:
                 for player in players:
-                    team_count = fixture_counts.get((next_gw.id, player.team_id), 1)
+                    # Default 0: teams absent from fixture_counts have NO fixture
+                    # (previously defaulted to 1 which caused blank GW teams like Man City
+                    #  to be treated as having a fixture → has_blank_gw was never set True)
+                    team_count = fixture_counts.get((next_gw.id, player.team_id), 0)
                     player.has_blank_gw = team_count == 0
                     player.has_double_gw = team_count >= 2
 
@@ -347,9 +353,11 @@ class DataProcessor:
         player.news_added = news_added
         player.suspension_risk = suspension_risk
 
-        # Fixture context
+        # Fixture context — next_fix is {} for blank GW teams (no upcoming fixture)
+        # FDR defaults to 3 (mid-difficulty) when absent; is_home defaults to False
+        # (not True) so blank-GW players don't misleadingly appear as home games.
         player.fdr_next = next_fix.get("fdr", 3)
-        player.is_home_next = next_fix.get("is_home", True)
+        player.is_home_next = next_fix.get("is_home", False)
 
         # Set piece taker heuristic: top creativity or many assists in team
         player.is_set_piece_taker = player.creativity > 50 or player.assists >= 3
@@ -384,10 +392,23 @@ class DataProcessor:
             )
             fixtures = result.scalars().all()
 
-            lookup: dict[int, dict] = {}
+            # Build lookup: for double GW teams keep the BEST (lowest) FDR fixture
+            # and mark is_home=True if either fixture is at home.
+            # Previous code overwrote the first fixture with the second, losing FDR data.
+            raw: dict[int, list[dict]] = {}
             for f in fixtures:
-                lookup[f.team_home_id] = {"fdr": f.team_h_difficulty, "is_home": True}
-                lookup[f.team_away_id] = {"fdr": f.team_a_difficulty, "is_home": False}
+                raw.setdefault(f.team_home_id, []).append({"fdr": f.team_h_difficulty, "is_home": True})
+                raw.setdefault(f.team_away_id, []).append({"fdr": f.team_a_difficulty, "is_home": False})
+
+            lookup: dict[int, dict] = {}
+            for team_id, fix_list in raw.items():
+                best_fdr = min(fx["fdr"] for fx in fix_list)
+                has_home = any(fx["is_home"] for fx in fix_list)
+                lookup[team_id] = {
+                    "fdr": best_fdr,
+                    "is_home": has_home,
+                    "fixture_count": len(fix_list),
+                }
 
             return lookup
 
@@ -729,7 +750,13 @@ class DataProcessor:
 
                 # Status flags
                 "status": p.status,
-                "chance_of_playing": (p.chance_of_playing_next_round or 100) / 100,
+                # Use explicit None check — `(0 or 100)` evaluates to 100 in Python,
+                # which would treat a 0%-chance player as fully fit (100%).
+                "chance_of_playing": (
+                    p.chance_of_playing_next_round / 100
+                    if p.chance_of_playing_next_round is not None
+                    else 1.0
+                ),
                 "suspension_risk": int(p.suspension_risk),
                 "form_trend": p.form_trend,
 
