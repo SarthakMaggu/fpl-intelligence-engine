@@ -364,7 +364,6 @@ async def get_transfer_suggestions(
         }
     except Exception as exc:
         # Non-fatal — greedy suggestions still returned
-        from loguru import logger
         logger.warning(f"ILP optimal plan failed (non-fatal): {exc}")
 
     # ── News alerts from Redis (populated by NewsAgent during squad sync) ─────
