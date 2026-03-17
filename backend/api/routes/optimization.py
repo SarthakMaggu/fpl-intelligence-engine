@@ -206,6 +206,8 @@ async def get_captain_recommendations(
         "is_home_next": p.Player.is_home_next,
         "selected_by_percent": p.Player.selected_by_percent,
         "has_double_gw": p.Player.has_double_gw,
+        # Include blank GW flag so captain engine can filter out players with no fixture
+        "has_blank_gw": p.Player.has_blank_gw,
     } for p in xi_picks])
 
     candidates = captain_engine.rank_candidates(xi_ids, df, xi_ids)

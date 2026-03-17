@@ -37,11 +37,51 @@ function fdrStyle(fdr: number | null | undefined) {
 }
 
 const POSITIONS: Record<number, string> = { 1: "GK", 2: "DEF", 3: "MID", 4: "FWD" };
-const CHIP_LABELS: Record<string, string> = {
-  wildcard: "WILDCARD",
-  free_hit: "FREE HIT",
-  bench_boost: "BENCH BOOST",
-  triple_captain: "TRIPLE CAP",
+const CHIP_CONFIG: Record<string, {
+  label: string;
+  icon: string;
+  description: string;
+  accentColor: string;
+  bgColor: string;
+  borderColor: string;
+  glowColor: string;
+}> = {
+  wildcard: {
+    label: "WILDCARD",
+    icon: "🃏",
+    description: "Rebuild your entire squad — unlimited free transfers for one GW",
+    accentColor: "#a855f7",
+    bgColor: "rgba(168,85,247,0.07)",
+    borderColor: "rgba(168,85,247,0.25)",
+    glowColor: "rgba(168,85,247,0.12)",
+  },
+  free_hit: {
+    label: "FREE HIT",
+    icon: "⚡",
+    description: "Temporary squad for one GW — reverts to current squad after",
+    accentColor: "#38bdf8",
+    bgColor: "rgba(56,189,248,0.07)",
+    borderColor: "rgba(56,189,248,0.25)",
+    glowColor: "rgba(56,189,248,0.12)",
+  },
+  bench_boost: {
+    label: "BENCH BOOST",
+    icon: "📈",
+    description: "Score points from ALL 15 players — bench comes alive",
+    accentColor: "#22c55e",
+    bgColor: "rgba(34,197,94,0.07)",
+    borderColor: "rgba(34,197,94,0.25)",
+    glowColor: "rgba(34,197,94,0.12)",
+  },
+  triple_captain: {
+    label: "TRIPLE CAPTAIN",
+    icon: "👑",
+    description: "Captain scores 3x instead of 2x — premium pick",
+    accentColor: "#f59e0b",
+    bgColor: "rgba(245,158,11,0.07)",
+    borderColor: "rgba(245,158,11,0.25)",
+    glowColor: "rgba(245,158,11,0.12)",
+  },
 };
 
 interface GWState {
@@ -168,7 +208,7 @@ export default function StrategyPage() {
               const [chip, rec]: [string, any] = urgentEntry;
               plays.push({
                 rank: rank++, icon: Zap,
-                label: `Play ${CHIP_LABELS[chip] ?? chip.toUpperCase()} now`,
+                label: `Play ${CHIP_CONFIG[chip]?.label ?? chip.toUpperCase()} now`,
                 detail: `GW${rec.recommended_gw ?? rec.best_gw} · ${Math.round((rec.confidence ?? 0) * 100)}% confidence`,
                 impact: `+${rec.expected_gain?.toFixed(1)} xPts`, color: "var(--green)", urgent: true,
               });
@@ -415,55 +455,153 @@ export default function StrategyPage() {
         )}
 
         {chipRecs && Object.keys(chipRecs).length > 0 && (
-          <Section title="Chip Strategy" accent="var(--green)">
-            {/* ENGINE RECOMMENDS — highlight any urgent chip */}
+          <Section title="Chip Strategy" accent="#a855f7">
+            {/* ENGINE ACTION BANNER — urgent chip */}
             {(() => {
               const urgentEntry = Object.entries(chipRecs).find(([, rec]: [string, any]) => rec.urgency === "urgent");
               if (!urgentEntry) return null;
               const [chip, rec]: [string, any] = urgentEntry;
+              const cfg = CHIP_CONFIG[chip];
               return (
-                <div style={{
-                  display: "flex", alignItems: "center", gap: 7, marginBottom: 12,
-                  padding: "6px 10px", borderRadius: 8,
-                  background: "rgba(34,197,94,0.07)", border: "1px solid rgba(34,197,94,0.25)",
-                }}>
-                  <IconEngine size={11} style={{ color: "var(--green)", flexShrink: 0 }} />
-                  <span style={{ fontFamily: "var(--font-ui)", fontSize: 10, color: "var(--green)", fontWeight: 600, letterSpacing: "0.04em" }}>
-                    BEST STRATEGY: Play <strong>{CHIP_LABELS[chip] ?? chip.toUpperCase()}</strong> now · +{rec.expected_gain?.toFixed(1)} xPts expected
-                  </span>
-                </div>
+                <motion.div
+                  initial={{ opacity: 0, scale: 0.98 }}
+                  animate={{ opacity: 1, scale: 1 }}
+                  transition={{ type: "spring", stiffness: 300, damping: 28 }}
+                  style={{
+                    display: "flex", alignItems: "center", gap: 10, marginBottom: 16,
+                    padding: "10px 14px", borderRadius: 10,
+                    background: cfg?.bgColor ?? "rgba(34,197,94,0.07)",
+                    border: `1px solid ${cfg?.borderColor ?? "rgba(34,197,94,0.25)"}`,
+                    boxShadow: `0 0 20px ${cfg?.glowColor ?? "transparent"}`,
+                  }}
+                >
+                  <span style={{ fontSize: 20, flexShrink: 0 }}>{cfg?.icon ?? "⚡"}</span>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ fontFamily: "var(--font-display)", fontSize: 12, fontWeight: 700, color: cfg?.accentColor ?? "var(--green)", letterSpacing: "0.03em", marginBottom: 2 }}>
+                      PLAY NOW: {cfg?.label ?? chip.toUpperCase()} · GW{rec.recommended_gw ?? rec.best_gw}
+                    </div>
+                    <div style={{ fontFamily: "var(--font-ui)", fontSize: 11, color: "var(--text-2)" }}>
+                      +{rec.expected_gain?.toFixed(1)} xPts gain expected{rec.confidence != null ? ` · ${Math.round(rec.confidence * 100)}% confidence` : ""}
+                    </div>
+                  </div>
+                  <span style={{
+                    fontFamily: "var(--font-ui)", fontSize: 9, fontWeight: 700,
+                    color: cfg?.accentColor ?? "var(--green)",
+                    background: cfg?.bgColor ?? "rgba(34,197,94,0.12)",
+                    border: `1px solid ${cfg?.borderColor ?? "rgba(34,197,94,0.25)"}`,
+                    borderRadius: 999, padding: "3px 10px", letterSpacing: "0.08em", flexShrink: 0,
+                  }}>NOW</span>
+                </motion.div>
               );
             })()}
-            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(196px, 1fr))", gap: 10 }}>
+
+            {/* Per-chip cards — distinctive visual per chip type */}
+            <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
               {Object.entries(chipRecs).map(([chip, rec]: [string, any], i) => {
+                const cfg = CHIP_CONFIG[chip];
                 const isUrgent = rec.urgency === "urgent";
+                const gwNum = rec.recommended_gw ?? rec.best_gw;
+                const gain = rec.expected_gain?.toFixed(1);
+                const conf = rec.confidence != null ? Math.round(rec.confidence * 100) : null;
+
                 return (
                   <motion.div
                     key={chip}
-                    initial={{ opacity: 0, y: 8 }}
-                    animate={{ opacity: 1, y: 0 }}
-                    transition={{ delay: i * 0.08, type: "spring", stiffness: 280, damping: 26 }}
+                    initial={{ opacity: 0, x: -12 }}
+                    animate={{ opacity: 1, x: 0 }}
+                    transition={{ delay: i * 0.1, type: "spring", stiffness: 280, damping: 26 }}
                     style={{
-                      background: isUrgent ? "rgba(34,197,94,0.05)" : "rgba(255,255,255,0.02)",
-                      border: `1px solid ${isUrgent ? "rgba(34,197,94,0.2)" : "var(--divider)"}`,
-                      borderRadius: 12, padding: "14px 14px 12px", cursor: "default",
+                      display: "flex",
+                      gap: 14,
+                      alignItems: "flex-start",
+                      background: cfg?.bgColor ?? "rgba(255,255,255,0.03)",
+                      border: `1px solid ${isUrgent ? (cfg?.borderColor ?? "var(--divider)") : "var(--divider)"}`,
+                      borderLeft: `3px solid ${cfg?.accentColor ?? "var(--text-3)"}`,
+                      borderRadius: 12,
+                      padding: "14px 16px",
+                      position: "relative",
+                      overflow: "hidden",
+                      boxShadow: isUrgent ? `0 0 24px ${cfg?.glowColor ?? "transparent"}` : undefined,
                     }}
                   >
-                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 10 }}>
-                      <span style={{ fontFamily: "var(--font-display)", fontSize: 11, fontWeight: 700, color: isUrgent ? "var(--green)" : "var(--text-2)", letterSpacing: "0.04em" }}>
-                        {CHIP_LABELS[chip] ?? chip.toUpperCase().replace(/_/g, " ")}
-                      </span>
-                      {isUrgent && (
-                        <span style={{ fontFamily: "var(--font-ui)", fontSize: 9, fontWeight: 600, color: "var(--green)", background: "rgba(34,197,94,0.12)", border: "1px solid rgba(34,197,94,0.25)", borderRadius: 999, padding: "2px 7px" }}>NOW</span>
+                    {/* Background icon watermark */}
+                    <div style={{
+                      position: "absolute", right: 14, top: "50%", transform: "translateY(-50%)",
+                      fontSize: 56, opacity: 0.06, pointerEvents: "none", lineHeight: 1,
+                    }}>
+                      {cfg?.icon ?? "⚡"}
+                    </div>
+
+                    {/* Left: big icon */}
+                    <div style={{
+                      width: 44, height: 44, borderRadius: 10, flexShrink: 0,
+                      display: "flex", alignItems: "center", justifyContent: "center",
+                      background: cfg?.bgColor ?? "rgba(255,255,255,0.04)",
+                      border: `1px solid ${cfg?.borderColor ?? "var(--divider)"}`,
+                      fontSize: 22,
+                    }}>
+                      {cfg?.icon ?? "⚡"}
+                    </div>
+
+                    {/* Right: content */}
+                    <div style={{ flex: 1, minWidth: 0, position: "relative", zIndex: 1 }}>
+                      {/* Header row */}
+                      <div style={{ display: "flex", alignItems: "center", gap: 7, marginBottom: 4 }}>
+                        <span style={{
+                          fontFamily: "var(--font-display)", fontSize: 12, fontWeight: 700,
+                          color: cfg?.accentColor ?? "var(--text-1)", letterSpacing: "0.04em",
+                        }}>
+                          {cfg?.label ?? chip.toUpperCase().replace(/_/g, " ")}
+                        </span>
+                        {isUrgent && (
+                          <span style={{
+                            fontFamily: "var(--font-ui)", fontSize: 8, fontWeight: 700,
+                            color: cfg?.accentColor ?? "var(--green)",
+                            background: cfg?.bgColor ?? "rgba(34,197,94,0.12)",
+                            border: `1px solid ${cfg?.borderColor ?? "rgba(34,197,94,0.3)"}`,
+                            borderRadius: 999, padding: "1px 7px", letterSpacing: "0.08em",
+                          }}>PLAY NOW</span>
+                        )}
+                      </div>
+
+                      {/* Description */}
+                      <div style={{ fontFamily: "var(--font-ui)", fontSize: 10, color: "var(--text-3)", lineHeight: 1.45, marginBottom: 8 }}>
+                        {cfg?.description ?? rec.reasoning ?? ""}
+                      </div>
+
+                      {/* Stats row */}
+                      <div style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
+                        <div>
+                          <span style={{ fontFamily: "var(--font-ui)", fontSize: 9, color: "var(--text-3)", letterSpacing: "0.06em", textTransform: "uppercase", display: "block", marginBottom: 1 }}>Optimal GW</span>
+                          <span style={{ fontFamily: "var(--font-data)", fontSize: 22, fontWeight: 700, color: cfg?.accentColor ?? "var(--text-1)", letterSpacing: "-0.03em", lineHeight: 1 }}>
+                            {gwNum ?? "—"}
+                          </span>
+                        </div>
+                        {gain && (
+                          <div>
+                            <span style={{ fontFamily: "var(--font-ui)", fontSize: 9, color: "var(--text-3)", letterSpacing: "0.06em", textTransform: "uppercase", display: "block", marginBottom: 1 }}>Expected gain</span>
+                            <span style={{ fontFamily: "var(--font-data)", fontSize: 18, fontWeight: 600, color: cfg?.accentColor ?? "var(--green)", letterSpacing: "-0.02em", lineHeight: 1 }}>
+                              +{gain} xP
+                            </span>
+                          </div>
+                        )}
+                        {conf != null && (
+                          <div>
+                            <span style={{ fontFamily: "var(--font-ui)", fontSize: 9, color: "var(--text-3)", letterSpacing: "0.06em", textTransform: "uppercase", display: "block", marginBottom: 1 }}>Confidence</span>
+                            <span style={{ fontFamily: "var(--font-data)", fontSize: 16, fontWeight: 600, color: conf >= 70 ? (cfg?.accentColor ?? "var(--green)") : "var(--text-2)", letterSpacing: "-0.02em", lineHeight: 1 }}>
+                              {conf}%
+                            </span>
+                          </div>
+                        )}
+                      </div>
+
+                      {/* Reasoning if different from description */}
+                      {rec.reasoning && rec.reasoning !== cfg?.description && (
+                        <div style={{ marginTop: 8, fontFamily: "var(--font-ui)", fontSize: 10, color: "var(--text-3)", lineHeight: 1.45, fontStyle: "italic" }}>
+                          {rec.reasoning}
+                        </div>
                       )}
                     </div>
-                    <div style={{ fontFamily: "var(--font-data)", fontSize: 28, fontWeight: 600, color: isUrgent ? "var(--green)" : "var(--text-1)", letterSpacing: "-0.04em", lineHeight: 1, marginBottom: 4 }}>
-                      GW{rec.recommended_gw ?? rec.best_gw}
-                    </div>
-                    <div style={{ fontFamily: "var(--font-ui)", fontSize: 11, color: "var(--text-3)", marginBottom: rec.reasoning ? 6 : 0 }}>
-                      +{rec.expected_gain?.toFixed(1)} xPts{rec.confidence != null ? ` · ${Math.round(rec.confidence * 100)}% conf` : ""}
-                    </div>
-                    {rec.reasoning && <div style={{ fontFamily: "var(--font-ui)", fontSize: 10, color: "var(--text-3)", lineHeight: 1.45 }}>{rec.reasoning}</div>}
                   </motion.div>
                 );
               })}

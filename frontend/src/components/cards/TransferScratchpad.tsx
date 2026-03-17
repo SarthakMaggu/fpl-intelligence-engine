@@ -32,12 +32,20 @@ export default function TransferScratchpad({ suggestions, freeTransfers, bankMil
   const ftColor = freeTransfers >= 3 ? "var(--green)" : freeTransfers === 2 ? "var(--amber)" : "var(--text-3)";
 
   // Pair ILP transfers_out with transfers_in by index (real squad changes)
-  const ilpMoves = optimalSquad
+  const allIlpMoves = optimalSquad
     ? optimalSquad.transfers_out.map((out, i) => ({
         out,
         inn: optimalSquad.transfers_in[i] ?? null,
       })).filter(m => m.inn)
     : [];
+
+  // Split moves into free (within FT budget) and hit (extra)
+  const ilpFreeMoves = allIlpMoves.slice(0, freeTransfers);
+  const ilpHitMoves  = allIlpMoves.slice(freeTransfers);
+  const ilpMoves = allIlpMoves; // keep for empty-state check
+
+  // Number of extra transfers beyond free budget
+  const extraTransfers = Math.max(0, (optimalSquad?.transfers_needed ?? 0) - freeTransfers);
 
   // Free bench↔XI swaps (no transfer cost)
   const benchSwaps: BenchSwap[] = optimalSquad?.bench_swaps ?? [];
@@ -552,7 +560,56 @@ export default function TransferScratchpad({ suggestions, freeTransfers, bankMil
                 ✓ Squad is already optimal — no changes needed
               </div>
             )}
-            {/* Real transfers (sell/buy with possible hit cost) */}
+            {/* Hit warning when ILP needs more than free transfers */}
+            {extraTransfers > 0 && (
+              <div style={{
+                display: "flex", alignItems: "flex-start", gap: 8, padding: "9px 11px", marginBottom: 10,
+                background: "rgba(239,68,68,0.06)", border: "1px solid rgba(239,68,68,0.22)", borderRadius: 9,
+              }}>
+                <AlertTriangle size={13} style={{ color: "var(--red)", flexShrink: 0, marginTop: 1 }} />
+                <div>
+                  <div style={{ fontFamily: "var(--font-ui)", fontSize: 11, fontWeight: 600, color: "var(--red)", marginBottom: 2 }}>
+                    −{extraTransfers * 4}pt hit · {extraTransfers} extra transfer{extraTransfers > 1 ? "s" : ""} beyond free budget
+                  </div>
+                  <div style={{ fontFamily: "var(--font-ui)", fontSize: 10, color: "var(--text-3)", lineHeight: 1.45 }}>
+                    ILP shows the globally optimal plan. Only make the extra moves if the gain justifies the hit.
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {/* Real transfers — FREE moves first */}
+            {ilpFreeMoves.length > 0 && (
+              <div style={{ marginBottom: ilpHitMoves.length > 0 ? 4 : 0 }}>
+                <div style={{ fontFamily: "var(--font-ui)", fontSize: 9, fontWeight: 700, color: "var(--green)", letterSpacing: "0.1em", textTransform: "uppercase", marginBottom: 6 }}>
+                  Free transfers
+                </div>
+                <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                  {ilpFreeMoves.map(({ out, inn }, i) => (
+                    <ILPMoveRow key={`free-${i}`} out={out} inn={inn} index={i} delay={0.55} />
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* Hit moves — clearly labelled extra */}
+            {ilpHitMoves.length > 0 && (
+              <div style={{ marginTop: 10 }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 5, marginBottom: 6 }}>
+                  <div style={{ fontFamily: "var(--font-ui)", fontSize: 9, fontWeight: 700, color: "var(--red)", letterSpacing: "0.1em", textTransform: "uppercase" }}>
+                    Hit moves (−4pt each)
+                  </div>
+                </div>
+                <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                  {ilpHitMoves.map(({ out, inn }, i) => (
+                    <ILPMoveRow key={`hit-${i}`} out={out} inn={inn} index={i} delay={0.65} dimmed />
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* Legacy: render all moves if no split needed (e.g. no freeTransfers info) */}
+            {ilpFreeMoves.length === 0 && ilpHitMoves.length === 0 && (
             <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
               {ilpMoves.map(({ out, inn }, i) => (
                 <motion.div
@@ -612,6 +669,7 @@ export default function TransferScratchpad({ suggestions, freeTransfers, bankMil
                 </motion.div>
               ))}
             </div>
+            )}
 
             {/* Free bench↔XI swaps (no transfer cost) */}
             {benchSwaps.length > 0 && (
@@ -934,6 +992,67 @@ function BenchChip({
         {xpts.toFixed(1)} xP
       </div>
     </div>
+  );
+}
+
+/* ── ILPMoveRow — reusable row for a single ILP transfer move ─────────── */
+function ILPMoveRow({
+  out,
+  inn,
+  index,
+  delay,
+  dimmed,
+}: {
+  out: { web_name: string; element_type: number; predicted_xpts_next: number | null; team_code?: number | null; is_bench_player?: boolean };
+  inn: { web_name: string; element_type: number; predicted_xpts_next: number | null; team_code?: number | null; is_xi_player?: boolean; displaces?: { web_name: string; element_type: number; predicted_xpts_next: number | null; team_code?: number | null } | null } | null;
+  index: number;
+  delay: number;
+  dimmed?: boolean;
+}) {
+  if (!inn) return null;
+  return (
+    <motion.div
+      initial={{ opacity: 0, x: -6 }}
+      animate={{ opacity: dimmed ? 0.7 : 1, x: 0 }}
+      transition={{ delay: delay + index * 0.07, type: "spring", stiffness: 340, damping: 28 }}
+      style={{ display: "flex", flexDirection: "column", gap: 5 }}
+    >
+      <div style={{ display: "flex", alignItems: "center", gap: 7 }}>
+        <ILPPlayerChip
+          name={out.web_name}
+          pos={out.element_type}
+          xpts={out.predicted_xpts_next}
+          teamCode={out.team_code}
+          accent="red"
+          isBench={out.is_bench_player}
+        />
+        <svg width="10" height="10" viewBox="0 0 12 12" fill="none" style={{ flexShrink: 0 }}>
+          <path d="M2 6h8M7 3l3 3-3 3" stroke="var(--text-3)" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+        </svg>
+        <ILPPlayerChip
+          name={inn.web_name}
+          pos={inn.element_type}
+          xpts={inn.predicted_xpts_next}
+          teamCode={inn.team_code}
+          accent="green"
+          routeLabel={inn.is_xi_player === false ? "bench" : "XI"}
+        />
+      </div>
+      {inn.displaces && (
+        <div style={{ display: "flex", alignItems: "center", gap: 5, paddingLeft: 16 }}>
+          <div style={{ width: 1, height: 14, background: "var(--divider)", marginRight: 2, flexShrink: 0 }} />
+          <span style={{ fontFamily: "var(--font-ui)", fontSize: 9, color: "var(--text-3)", flexShrink: 0 }}>displaces</span>
+          <ILPPlayerChip
+            name={inn.displaces.web_name}
+            pos={inn.displaces.element_type}
+            xpts={inn.displaces.predicted_xpts_next}
+            teamCode={inn.displaces.team_code}
+            accent="red"
+            label="→ bench"
+          />
+        </div>
+      )}
+    </motion.div>
   );
 }
 

@@ -420,14 +420,10 @@ async def get_transfer_suggestions(
             "net_gain_3gw": s.net_gain_3gw,
             "recommendation": s.recommendation,
             "feasible": s.feasible,
-            "reasoning": (
-                s.reasoning
-                + (
-                    f" ⚠️ {_news_flag(s.player_in.get('web_name', ''))}"
-                    if _news_flag(s.player_in.get("web_name", ""))
-                    else ""
-                )
-            ),
+            # News alert is already in player_in.news_alert — keep reasoning clean.
+            # Appending the raw headline here caused article titles to leak into
+            # the reasoning string (e.g. "...Tottenham's draw with Liverpool...").
+            "reasoning": s.reasoning,
         }
         for s in suggestions
     ]

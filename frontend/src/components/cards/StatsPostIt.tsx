@@ -142,25 +142,41 @@ export default function StatsPostIt({ intel }: Props) {
               </div>
             )}
 
-            <div style={{ position: "relative", zIndex: 1 }}>
-              <div style={{ display: "flex", alignItems: "center", gap: 7, marginBottom: 4 }}>
+            <div style={{ position: "relative", zIndex: 1, minWidth: 0, flex: 1 }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 4, flexWrap: "wrap" }}>
                 {cap.team_code && (
                   <img
                     src={`https://resources.premierleague.com/premierleague/badges/25/t${cap.team_code}.png`}
                     alt={cap.team_short_name ?? ""}
-                    width={18} height={18}
+                    width={16} height={16}
                     style={{ objectFit: "contain", opacity: 0.85, flexShrink: 0 }}
                     onError={(e) => { (e.target as HTMLImageElement).style.display = "none"; }}
                   />
                 )}
+                {cap.team_short_name && (
+                  <span style={{
+                    fontFamily: "var(--font-ui)",
+                    fontSize: 9,
+                    fontWeight: 700,
+                    color: "var(--text-3)",
+                    letterSpacing: "0.08em",
+                    textTransform: "uppercase",
+                    flexShrink: 0,
+                  }}>
+                    {cap.team_short_name}
+                  </span>
+                )}
                 <div
                   style={{
                     fontFamily: "var(--font-display)",
-                    fontSize: 22,
+                    fontSize: 20,
                     fontWeight: 600,
                     color: "var(--text-1)",
                     letterSpacing: "-0.03em",
                     lineHeight: 1.1,
+                    overflow: "hidden",
+                    textOverflow: "ellipsis",
+                    whiteSpace: "nowrap",
                   }}
                 >
                   {cap.web_name}
@@ -191,12 +207,12 @@ export default function StatsPostIt({ intel }: Props) {
               </div>
             </div>
 
-            <div style={{ textAlign: "right", position: "relative", zIndex: 1 }}>
+            <div style={{ textAlign: "right", position: "relative", zIndex: 1, flexShrink: 0, paddingLeft: 8 }}>
               <span
                 style={{
                   display: "block",
                   fontFamily: "var(--font-data)",
-                  fontSize: 44,
+                  fontSize: 40,
                   fontWeight: 600,
                   color: "var(--green)",
                   lineHeight: 0.9,

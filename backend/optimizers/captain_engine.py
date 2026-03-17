@@ -59,6 +59,13 @@ class CaptainEngine:
             if pos == 1:  # No GK captains
                 continue
 
+            # Skip blank GW players — they can't score points, pointless to captain
+            if bool(row.get("has_blank_gw", False)):
+                continue
+            # Skip 0-xPts players (injured, blank GW, suspended)
+            if float(row.get("predicted_xpts_next", 0) or 0) <= 0:
+                continue
+
             player_id = int(row["id"])
             xpts = float(row.get("predicted_xpts_next", 0) or 0)
             fdr = int(row.get("fdr_next", 3) or 3)
@@ -122,6 +129,10 @@ class CaptainEngine:
                 continue
 
             xpts = float(p.get("predicted_xpts_next", 0) or 0)
+
+            # Skip blank GW players and 0-xPts players — useless as captain picks
+            if bool(p.get("has_blank_gw", False)) or xpts <= 0:
+                continue
             fdr = int(p.get("fdr_next", 3) or 3)
             is_home = bool(p.get("is_home_next", True))
             ownership = float(p.get("selected_by_percent", 50) or 50)
