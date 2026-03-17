@@ -1042,13 +1042,26 @@ function SeasonView({ review }: { review: SeasonReview | null }) {
   );
   // Decisions logged but GW not resolved yet
   if ((review as any).analysis_mode === "pending") return (
-    <div style={{ textAlign: "center", padding: 40, fontFamily: "var(--font-ui)", fontSize: 13, lineHeight: 1.7 }}>
-      <div style={{ fontSize: 22, marginBottom: 8 }}>⏳</div>
-      <div style={{ color: "var(--text-1)", fontWeight: 600, marginBottom: 6 }}>
-        {review.total_decisions} decision{review.total_decisions !== 1 ? "s" : ""} logged
-      </div>
-      <div style={{ color: "var(--text-3)", fontSize: 12 }}>
-        {review.message}
+    <div style={{ padding: "32px 16px", fontFamily: "var(--font-ui)", fontSize: 13, lineHeight: 1.7 }}>
+      <div style={{
+        padding: "16px 18px",
+        background: "var(--surface)",
+        border: "1px solid var(--divider)",
+        borderRadius: 12,
+        display: "flex", flexDirection: "column", gap: 8,
+      }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <div style={{ width: 6, height: 6, borderRadius: "50%", background: "var(--amber)", flexShrink: 0 }} />
+          <span style={{ fontFamily: "var(--font-ui)", fontSize: 10, fontWeight: 600, color: "var(--amber)", letterSpacing: "0.08em", textTransform: "uppercase" }}>
+            Pending Resolution
+          </span>
+        </div>
+        <div style={{ color: "var(--text-1)", fontWeight: 600, fontSize: 14 }}>
+          {review.total_decisions} decision{review.total_decisions !== 1 ? "s" : ""} tracked this season
+        </div>
+        <div style={{ color: "var(--text-3)", fontSize: 11, lineHeight: 1.6 }}>
+          {review.message}
+        </div>
       </div>
     </div>
   );
@@ -1061,8 +1074,15 @@ function SeasonView({ review }: { review: SeasonReview | null }) {
         className="glass"
         style={{ padding: 16, borderRadius: 12, marginBottom: 16 }}
       >
-        <div style={{ fontFamily: "var(--font-ui)", fontSize: 11, color: "var(--text-3)", letterSpacing: "0.08em", textTransform: "uppercase", marginBottom: 12 }}>
-          Season overview
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
+          <div style={{ fontFamily: "var(--font-ui)", fontSize: 11, color: "var(--text-3)", letterSpacing: "0.08em", textTransform: "uppercase" }}>
+            Season overview
+          </div>
+          {(review as any).pending_decisions > 0 && (
+            <span style={{ fontFamily: "var(--font-ui)", fontSize: 9, fontWeight: 600, color: "var(--amber)", background: "rgba(245,158,11,0.1)", border: "1px solid rgba(245,158,11,0.2)", borderRadius: 20, padding: "2px 8px", letterSpacing: "0.06em" }}>
+              {(review as any).pending_decisions} pending
+            </span>
+          )}
         </div>
         <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 14 }}>
           {[
@@ -1256,8 +1276,7 @@ function OracleView({
   const hasUnresolved = snapshots.some(
     (s) => !s.resolved || s.actual_algo_points == null || s.actual_oracle_points == null || !s.top_team || s.top_team.status === "unavailable"
   );
-  const [viewTopTeamGW, setViewTopTeamGW] = useState<number | null>(null);
-  const viewSnap = viewTopTeamGW !== null ? snapshots.find(s => s.gameweek_id === viewTopTeamGW) : null;
+  // (pitch preview removed — top team squad view is not shown)
 
   // Helper to format chip label for display
   const fmtChip = (chip: string | null | undefined) =>
@@ -1436,15 +1455,13 @@ function OracleView({
                       <div style={{ fontFamily: "var(--font-ui)", fontSize: 8, color: "var(--text-3)", textTransform: "uppercase" as const, letterSpacing: "0.06em", marginTop: 4 }}>Your actual</div>
                     </div>
 
-                    {/* #1 FPL team actual — with chip badge + view link */}
+                    {/* #1 FPL team actual — chip badge */}
                     <div
                       style={{
                         background: "var(--surface-2)", borderRadius: 10, padding: "10px 12px",
                         border: s.top_team ? "1px solid rgba(255,255,255,0.1)" : "1px solid var(--divider)",
-                        textAlign: "center", position: "relative", cursor: (s.top_team && s.top_team.squad && s.top_team.squad.length > 0) ? "pointer" : "default",
+                        textAlign: "center", position: "relative",
                       }}
-                      onClick={() => s.top_team && s.top_team.squad && s.top_team.squad.length > 0 && setViewTopTeamGW(s.gameweek_id)}
-                      title={s.top_team && s.top_team.squad && s.top_team.squad.length > 0 ? "Click to view this team's squad" : undefined}
                     >
                       {s.top_team ? (
                         <>
@@ -1690,109 +1707,6 @@ function OracleView({
         </div>
       )}
 
-      {/* ── Top Team Squad Modal (slide-up overlay) ── */}
-      {viewTopTeamGW !== null && viewSnap?.top_team && (
-        <motion.div
-          initial={{ opacity: 0 }}
-          animate={{ opacity: 1 }}
-          style={{
-            position: "fixed", inset: 0, zIndex: 999,
-            background: "rgba(0,0,0,0.88)",
-            display: "flex", alignItems: "flex-end",
-          }}
-          onClick={() => setViewTopTeamGW(null)}
-        >
-          <motion.div
-            initial={{ y: "100%" }}
-            animate={{ y: 0 }}
-            transition={{ type: "spring", damping: 32, stiffness: 320 }}
-            onClick={(e) => e.stopPropagation()}
-            style={{
-              width: "100%",
-              maxHeight: "88vh",
-              background: "#0B0B0D",
-              borderRadius: "20px 20px 0 0",
-              border: "1px solid rgba(255,255,255,0.09)",
-              overflowY: "auto",
-              padding: "20px 16px 32px",
-            }}
-          >
-            {/* Drag handle */}
-            <div style={{ width: 36, height: 4, background: "rgba(255,255,255,0.15)", borderRadius: 2, margin: "0 auto 18px" }} />
-
-            {/* Modal header */}
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 16 }}>
-              <div>
-                <div style={{ fontFamily: "var(--font-display)", fontSize: 18, fontWeight: 700, color: "var(--text-1)", letterSpacing: "-0.03em" }}>
-                  {viewSnap.top_team.team_name ?? "Top FPL Team"} · GW{viewTopTeamGW}
-                </div>
-                <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 4, flexWrap: "wrap" }}>
-                  <span style={{ fontFamily: "var(--font-data)", fontSize: 20, fontWeight: 700, color: "var(--text-1)" }}>
-                    {viewSnap.top_team.display_points ?? viewSnap.top_team.points ?? "Data unavailable"} pts
-                  </span>
-                  {viewSnap.top_team.chip && (
-                    <span style={{ fontFamily: "var(--font-data)", fontSize: 9, fontWeight: 700, color: "var(--amber)", background: "rgba(245,158,11,0.12)", border: "1px solid rgba(245,158,11,0.3)", borderRadius: 4, padding: "2px 6px" }}>
-                      {viewSnap.top_team.chip.replace("3xc","Triple Captain").replace("bboost","Bench Boost").replace("freehit","Free Hit").replace("wildcard","Wildcard")}
-                    </span>
-                  )}
-                  {viewSnap.top_team.captain && (
-                    <span style={{ fontFamily: "var(--font-ui)", fontSize: 10, color: "var(--text-3)" }}>
-                      C: <span style={{ color: "var(--text-2)", fontWeight: 600 }}>{viewSnap.top_team.captain}</span>
-                    </span>
-                  )}
-                </div>
-              </div>
-              <button
-                onClick={() => setViewTopTeamGW(null)}
-                style={{
-                  background: "rgba(255,255,255,0.06)", border: "1px solid rgba(255,255,255,0.1)",
-                  borderRadius: 8, width: 32, height: 32, cursor: "pointer",
-                  color: "var(--text-3)", fontFamily: "var(--font-ui)", fontSize: 14,
-                  display: "flex", alignItems: "center", justifyContent: "center",
-                  flexShrink: 0,
-                }}
-              >
-                ✕
-              </button>
-            </div>
-
-            {/* Chip strip note */}
-            {viewSnap.top_team.chip && (viewSnap.top_team.chip_adjustment ?? 0) > 0 && (
-              <div style={{ marginBottom: 12, padding: "7px 10px", borderRadius: 8, background: "rgba(245,158,11,0.07)", border: "1px solid rgba(245,158,11,0.2)", fontFamily: "var(--font-ui)", fontSize: 10, color: "var(--amber)" }}>
-                {viewSnap.top_team.chip.replace("3xc","Triple Captain").replace("bboost","Bench Boost")} contributed ~{viewSnap.top_team.chip_adjustment} pts · normalised score: {viewSnap.top_team.points_normalised} pts
-              </div>
-            )}
-
-            {/* Squad pitch — use full-size formation grid */}
-            {viewSnap.top_team.squad && viewSnap.top_team.squad.length > 0 ? (
-              <OracleFormationGrid
-                squad={viewSnap.top_team.squad.map(n => ({ name: n, team_code: null, team_short_name: null }))}
-                formation={viewSnap.oracle_formation}
-                captain={viewSnap.top_team.captain}
-              />
-            ) : (
-              /* Squad names not stored — show what we know */
-              <div style={{ padding: "16px 0" }}>
-                <div style={{ fontFamily: "var(--font-ui)", fontSize: 10, color: "var(--text-3)", textTransform: "uppercase", letterSpacing: "0.08em", marginBottom: 10 }}>
-                  Full squad unavailable — partial data
-                </div>
-                {viewSnap.top_team.captain && (
-                  <div style={{ padding: "10px 14px", borderRadius: 8, background: "rgba(245,158,11,0.07)", border: "1px solid rgba(245,158,11,0.2)", marginBottom: 8 }}>
-                    <div style={{ fontFamily: "var(--font-ui)", fontSize: 9, color: "var(--amber)", textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 3 }}>Captain</div>
-                    <div style={{ fontFamily: "var(--font-ui)", fontSize: 13, fontWeight: 600, color: "var(--text-1)" }}>{viewSnap.top_team.captain}</div>
-                  </div>
-                )}
-                <div style={{ padding: "10px 14px", borderRadius: 8, background: "var(--surface)", border: "1px solid var(--divider)" }}>
-                  <div style={{ fontFamily: "var(--font-ui)", fontSize: 10, color: "var(--text-3)", lineHeight: 1.6 }}>
-                    Full squad picks were not stored for this GW during auto-resolve.
-                    Click <strong style={{ color: "var(--green)" }}>Fetch Actual Points</strong> on the Oracle tab to attempt re-resolve.
-                  </div>
-                </div>
-              </div>
-            )}
-          </motion.div>
-        </motion.div>
-      )}
     </>
   );
 }

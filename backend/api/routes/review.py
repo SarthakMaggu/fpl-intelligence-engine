@@ -73,23 +73,35 @@ async def get_gw_review(
     # for the active GW (decisions are tagged to the GW when made, even if the
     # action applies to the following GW).
     if gw_id is None:
-        latest_log_res = await db.execute(
+        # Prefer the most recently resolved GW (decisions with actual_points set)
+        # so pre-deadline we show last finished GW, not the upcoming GW's pending decisions.
+        resolved_log_res = await db.execute(
             select(DecisionLog)
-            .where(DecisionLog.team_id == team_id)
-            .order_by(DecisionLog.created_at.desc())
+            .where(DecisionLog.team_id == team_id, DecisionLog.resolved == True)
+            .order_by(DecisionLog.gameweek_id.desc())
         )
-        latest_log = latest_log_res.scalars().first()
-        if latest_log:
-            gw_id = latest_log.gameweek_id
+        resolved_log = resolved_log_res.scalars().first()
+        if resolved_log:
+            gw_id = resolved_log.gameweek_id
         else:
-            # Fall back to most recent finished GW if no decisions exist
-            gw_res = await db.execute(
-                select(Gameweek).where(Gameweek.finished == True).order_by(Gameweek.id.desc())
+            # No resolved decisions yet — fall back to latest logged decision
+            latest_log_res = await db.execute(
+                select(DecisionLog)
+                .where(DecisionLog.team_id == team_id)
+                .order_by(DecisionLog.created_at.desc())
             )
-            gw = gw_res.scalars().first()
-            if not gw:
-                return {"error": "No completed gameweeks found"}
-            gw_id = gw.id
+            latest_log = latest_log_res.scalars().first()
+            if latest_log:
+                gw_id = latest_log.gameweek_id
+            else:
+                # No decisions at all — fall back to most recent finished GW
+                gw_res = await db.execute(
+                    select(Gameweek).where(Gameweek.finished == True).order_by(Gameweek.id.desc())
+                )
+                gw = gw_res.scalars().first()
+                if not gw:
+                    return {"error": "No completed gameweeks found"}
+                gw_id = gw.id
 
     # Fetch decision log entries
     log_res = await db.execute(
@@ -201,7 +213,8 @@ async def get_season_review(
     )
     all_logs: list[DecisionLog] = log_res.scalars().all()
     # Resolved logs have actual_points set (post-GW oracle resolve)
-    logs = [l for l in all_logs if l.actual_points is not None]
+    logs = [l for l in all_logs if l.resolved and l.actual_points is not None]
+    pending_count = len([l for l in all_logs if not l.resolved])
 
     if not all_logs:
         payload = {
@@ -214,11 +227,12 @@ async def get_season_review(
         return payload
 
     if not logs:
+        # All decisions are pre-deadline pending — none resolved yet
         payload = {
             "team_id": team_id,
             "total_decisions": len(all_logs),
-            "pending_decisions": len(all_logs),
-            "message": f"{len(all_logs)} decision{'s' if len(all_logs) != 1 else ''} logged — awaiting GW resolution to compute outcomes. Check back after the gameweek finishes.",
+            "pending_decisions": pending_count,
+            "message": f"{len(all_logs)} decision{'s' if len(all_logs) != 1 else ''} logged — awaiting GW resolution to compute outcomes. Run 'Fetch Actual Points' on the Oracle page after the gameweek finishes.",
             "analysis_mode": "pending",
             "session_expires_at": session.expires_at.isoformat() if session else None,
         }
@@ -248,6 +262,7 @@ async def get_season_review(
     payload = {
         "team_id": team_id,
         "total_decisions": len(logs),
+        "pending_decisions": pending_count,
         "followed": len(followed),
         "ignored": len(logs) - len(followed),
         "adherence_rate": round(len(followed) / max(len(logs), 1), 2),

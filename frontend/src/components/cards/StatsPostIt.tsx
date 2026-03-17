@@ -441,6 +441,9 @@ export default function StatsPostIt({ intel }: Props) {
               <span
                 key={p.player_id}
                 style={{
+                  display: "inline-flex",
+                  alignItems: "center",
+                  gap: 5,
                   fontFamily: "var(--font-ui)",
                   fontSize: 11,
                   fontWeight: 500,
@@ -452,6 +455,15 @@ export default function StatsPostIt({ intel }: Props) {
                   letterSpacing: "-0.01em",
                 }}
               >
+                {p.team_code && (
+                  <img
+                    src={`https://resources.premierleague.com/premierleague/badges/25/t${p.team_code}.png`}
+                    alt=""
+                    width={12} height={12}
+                    style={{ objectFit: "contain", opacity: 0.7 }}
+                    onError={(e) => { (e.target as HTMLImageElement).style.display = "none"; }}
+                  />
+                )}
                 {p.web_name}
               </span>
             ))}

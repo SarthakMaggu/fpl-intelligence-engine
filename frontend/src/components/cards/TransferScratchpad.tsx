@@ -201,6 +201,9 @@ export default function TransferScratchpad({ suggestions, freeTransfers, bankMil
                   >
                     +{gainVal.toFixed(1)} xP
                   </span>
+                  <span style={{ fontFamily: "var(--font-ui)", fontSize: 9, color: "var(--text-3)", letterSpacing: "0.04em", display: "block", textAlign: "right", marginTop: 1 }}>
+                    over 3 GW
+                  </span>
                 </div>
 
                 {/* Confidence bar */}

@@ -1,7 +1,7 @@
 "use client";
 import { useEffect, useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import { Info, Crown, Zap, ArrowUpDown, ArrowLeftRight, AlertTriangle } from "lucide-react";
+import { Info, Crown, Zap, ArrowUpDown, ArrowLeftRight, AlertTriangle, Shuffle, TrendingUp } from "lucide-react";
 
 /* ── Engine icon — replaces generic Sparkles ──────────────────────────── */
 function IconEngine({ size = 11, style }: { size?: number; style?: React.CSSProperties }) {
@@ -39,7 +39,7 @@ function fdrStyle(fdr: number | null | undefined) {
 const POSITIONS: Record<number, string> = { 1: "GK", 2: "DEF", 3: "MID", 4: "FWD" };
 const CHIP_CONFIG: Record<string, {
   label: string;
-  icon: string;
+  Icon: React.ElementType;
   description: string;
   accentColor: string;
   bgColor: string;
@@ -48,7 +48,7 @@ const CHIP_CONFIG: Record<string, {
 }> = {
   wildcard: {
     label: "WILDCARD",
-    icon: "🃏",
+    Icon: Shuffle,
     description: "Rebuild your entire squad — unlimited free transfers for one GW",
     accentColor: "#a855f7",
     bgColor: "rgba(168,85,247,0.07)",
@@ -57,7 +57,7 @@ const CHIP_CONFIG: Record<string, {
   },
   free_hit: {
     label: "FREE HIT",
-    icon: "⚡",
+    Icon: Zap,
     description: "Temporary squad for one GW — reverts to current squad after",
     accentColor: "#38bdf8",
     bgColor: "rgba(56,189,248,0.07)",
@@ -66,7 +66,7 @@ const CHIP_CONFIG: Record<string, {
   },
   bench_boost: {
     label: "BENCH BOOST",
-    icon: "📈",
+    Icon: TrendingUp,
     description: "Score points from ALL 15 players — bench comes alive",
     accentColor: "#22c55e",
     bgColor: "rgba(34,197,94,0.07)",
@@ -75,7 +75,7 @@ const CHIP_CONFIG: Record<string, {
   },
   triple_captain: {
     label: "TRIPLE CAPTAIN",
-    icon: "👑",
+    Icon: Crown,
     description: "Captain scores 3x instead of 2x — premium pick",
     accentColor: "#f59e0b",
     bgColor: "rgba(245,158,11,0.07)",
@@ -267,7 +267,7 @@ export default function StrategyPage() {
             >
               <div>
                 {/* Header */}
-                <div style={{ display: "flex", alignItems: "baseline", gap: 12, marginBottom: 16 }}>
+                <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 12, marginBottom: 16 }}>
                   <div>
                     <h2 style={{ fontFamily: "var(--font-display)", fontSize: 20, fontWeight: 700, color: "var(--text-1)", letterSpacing: "-0.03em", margin: 0 }}>
                       Best Plays This Week
@@ -275,6 +275,12 @@ export default function StrategyPage() {
                     <p style={{ fontFamily: "var(--font-ui)", fontSize: 9, color: "var(--text-3)", margin: "2px 0 0", letterSpacing: "0.1em", textTransform: "uppercase" }}>
                       Engine synthesis
                     </p>
+                  </div>
+                  <div
+                    title="Best Plays synthesises signals across the captain engine, chip advisor, bench optimiser, and transfer XI into one ranked list — sorted by expected xPts gain. Priority Actions on the pitch page show per-constraint decisions for your actual squad; Best Plays gives a holistic view across all strategy levers simultaneously."
+                    style={{ marginTop: 4, flexShrink: 0 }}
+                  >
+                    <Info size={14} style={{ color: "var(--text-3)", cursor: "default" }} />
                   </div>
                 </div>
 
@@ -462,6 +468,7 @@ export default function StrategyPage() {
               if (!urgentEntry) return null;
               const [chip, rec]: [string, any] = urgentEntry;
               const cfg = CHIP_CONFIG[chip];
+              const UrgentIcon = cfg?.Icon ?? Zap;
               return (
                 <motion.div
                   initial={{ opacity: 0, scale: 0.98 }}
@@ -475,7 +482,9 @@ export default function StrategyPage() {
                     boxShadow: `0 0 20px ${cfg?.glowColor ?? "transparent"}`,
                   }}
                 >
-                  <span style={{ fontSize: 20, flexShrink: 0 }}>{cfg?.icon ?? "⚡"}</span>
+                  <div style={{ width: 28, height: 28, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
+                    <UrgentIcon size={18} style={{ color: cfg?.accentColor ?? "var(--green)" }} />
+                  </div>
                   <div style={{ flex: 1, minWidth: 0 }}>
                     <div style={{ fontFamily: "var(--font-display)", fontSize: 12, fontWeight: 700, color: cfg?.accentColor ?? "var(--green)", letterSpacing: "0.03em", marginBottom: 2 }}>
                       PLAY NOW: {cfg?.label ?? chip.toUpperCase()} · GW{rec.recommended_gw ?? rec.best_gw}
@@ -499,6 +508,7 @@ export default function StrategyPage() {
             <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
               {Object.entries(chipRecs).map(([chip, rec]: [string, any], i) => {
                 const cfg = CHIP_CONFIG[chip];
+                const ChipIcon = cfg?.Icon ?? Zap;
                 const isUrgent = rec.urgency === "urgent";
                 const gwNum = rec.recommended_gw ?? rec.best_gw;
                 const gain = rec.expected_gain?.toFixed(1);
@@ -514,33 +524,22 @@ export default function StrategyPage() {
                       display: "flex",
                       gap: 14,
                       alignItems: "flex-start",
-                      background: cfg?.bgColor ?? "rgba(255,255,255,0.03)",
+                      background: "rgba(255,255,255,0.02)",
                       border: `1px solid ${isUrgent ? (cfg?.borderColor ?? "var(--divider)") : "var(--divider)"}`,
                       borderLeft: `3px solid ${cfg?.accentColor ?? "var(--text-3)"}`,
                       borderRadius: 12,
                       padding: "14px 16px",
-                      position: "relative",
-                      overflow: "hidden",
                       boxShadow: isUrgent ? `0 0 24px ${cfg?.glowColor ?? "transparent"}` : undefined,
                     }}
                   >
-                    {/* Background icon watermark */}
+                    {/* Left: icon box */}
                     <div style={{
-                      position: "absolute", right: 14, top: "50%", transform: "translateY(-50%)",
-                      fontSize: 56, opacity: 0.06, pointerEvents: "none", lineHeight: 1,
-                    }}>
-                      {cfg?.icon ?? "⚡"}
-                    </div>
-
-                    {/* Left: big icon */}
-                    <div style={{
-                      width: 44, height: 44, borderRadius: 10, flexShrink: 0,
+                      width: 40, height: 40, borderRadius: 10, flexShrink: 0,
                       display: "flex", alignItems: "center", justifyContent: "center",
-                      background: cfg?.bgColor ?? "rgba(255,255,255,0.04)",
+                      background: "rgba(255,255,255,0.04)",
                       border: `1px solid ${cfg?.borderColor ?? "var(--divider)"}`,
-                      fontSize: 22,
                     }}>
-                      {cfg?.icon ?? "⚡"}
+                      <ChipIcon size={20} style={{ color: cfg?.accentColor ?? "var(--text-2)" }} />
                     </div>
 
                     {/* Right: content */}
