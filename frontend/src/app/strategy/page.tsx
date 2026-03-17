@@ -698,7 +698,7 @@ export default function StrategyPage() {
                     <div style={{ fontWeight: 600, color: "var(--blue)", marginBottom: 5 }}>UCB1 Multi-Armed Bandit</div>
                     Learns which FPL strategies produce the best GW outcomes over time. Each <em>arm</em> is a strategy option (e.g. greedy vs ILP vs hold). The bandit picks the arm with the highest <strong>UCB1 score</strong> — balancing exploitation of known good strategies with exploration of untried ones.
                     <br /><br />
-                    <span style={{ color: "var(--amber)" }}>Exploring</span> = not enough data yet — the engine is trying all options before settling. Scores (Q-values) update automatically after each GW outcome is recorded via <code style={{ fontSize: 10, background: "rgba(255,255,255,0.06)", padding: "1px 4px", borderRadius: 4 }}>POST /api/bandit/outcome</code>.
+                    <span style={{ color: "var(--amber)" }}>Exploring</span> = trying all options before settling on a strategy. <span style={{ color: "var(--text-3)" }}>Learning</span> = fresh install, no GW history yet — strategies will populate automatically after your first gameweek resolves. Scores (Q-values) update automatically after each GW outcome is recorded via <code style={{ fontSize: 10, background: "rgba(255,255,255,0.06)", padding: "1px 4px", borderRadius: 4 }}>POST /api/bandit/outcome</code>.
                   </div>
                 </motion.div>
               )}
@@ -746,8 +746,11 @@ export default function StrategyPage() {
                     </div>
                     <div style={{ fontFamily: "var(--font-display)", fontSize: 13, fontWeight: 700, color: "var(--text-1)", marginBottom: 4 }}>{bestArm}</div>
                     <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                      <span style={{ fontFamily: "var(--font-data)", fontSize: 10, color: "var(--text-3)" }}>{totalPulls} obs</span>
-                      {isExploring && <span style={{ fontFamily: "var(--font-ui)", fontSize: 9, color: "var(--amber)", background: "rgba(245,158,11,0.1)", borderRadius: 4, padding: "1px 5px" }}>exploring</span>}
+                      <span style={{ fontFamily: "var(--font-data)", fontSize: 10, color: "var(--text-3)" }}>
+                        {totalPulls === 0 ? "no history yet" : `${totalPulls} obs`}
+                      </span>
+                      {totalPulls === 0 && <span style={{ fontFamily: "var(--font-ui)", fontSize: 9, color: "var(--text-3)", background: "rgba(148,163,184,0.1)", borderRadius: 4, padding: "1px 5px" }}>learning</span>}
+                      {totalPulls > 0 && isExploring && <span style={{ fontFamily: "var(--font-ui)", fontSize: 9, color: "var(--amber)", background: "rgba(245,158,11,0.1)", borderRadius: 4, padding: "1px 5px" }}>exploring</span>}
                       {isBestDecision && <span style={{ fontFamily: "var(--font-ui)", fontSize: 9, color: "var(--blue)", background: "rgba(59,130,246,0.12)", borderRadius: 4, padding: "1px 5px" }}>best</span>}
                     </div>
                   </motion.div>

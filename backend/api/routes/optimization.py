@@ -46,7 +46,8 @@ async def optimize_full_squad(
     free_transfers = bank.free_transfers if bank else 1
     bank_pence = bank.bank if bank else 0
 
-    # Get existing squad for transfer penalty calculation
+    # Get existing squad for transfer penalty calculation.
+    # Fall back to most recent GW if current GW has no data (GW boundary).
     existing_squad = []
     if current_gw and bank:
         result = await db.execute(
@@ -56,6 +57,15 @@ async def optimize_full_squad(
             )
         )
         picks = result.scalars().all()
+        if not picks:
+            from sqlalchemy import desc as _desc
+            fb = await db.execute(
+                select(UserSquad)
+                .where(UserSquad.team_id == active_team_id)
+                .order_by(_desc(UserSquad.gameweek_id))
+                .limit(15)
+            )
+            picks = fb.scalars().all()
         existing_squad = [p.player_id for p in picks]
 
     # Build budget: team value + bank (can't exceed £100m for full squad rebuild)
@@ -156,7 +166,23 @@ async def get_captain_recommendations(
     )
     xi_picks = result.all()
     if not xi_picks:
-        raise HTTPException(404, "No squad data. Run /api/squad/sync first.")
+        # GW boundary fallback: use most recent synced squad
+        from sqlalchemy import desc as _desc
+        sub = (
+            select(UserSquad.gameweek_id)
+            .where(UserSquad.team_id == active_team_id)
+            .order_by(_desc(UserSquad.gameweek_id))
+            .limit(1)
+            .scalar_subquery()
+        )
+        result = await db.execute(
+            select(UserSquad, Player)
+            .join(Player, UserSquad.player_id == Player.id)
+            .where(UserSquad.team_id == active_team_id, UserSquad.gameweek_id == sub, UserSquad.position <= 11)
+        )
+        xi_picks = result.all()
+    if not xi_picks:
+        raise HTTPException(404, "No squad data. Visit the Squad tab first to sync your team.")
 
     xi_ids = [pick.UserSquad.player_id for pick in xi_picks]
     # Build team_id → Team mapping for badge display

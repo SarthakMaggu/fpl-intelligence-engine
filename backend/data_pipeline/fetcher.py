@@ -504,6 +504,42 @@ class DataFetcher:
                     f"with <270 season minutes (ppg inflated by small-sample artifact)"
                 )
 
+        # ── Blank / Double GW overrides ──────────────────────────────────────
+        # These are applied AFTER all model steps so they always take effect.
+        #
+        # BLANK GW (has_blank_gw=True):
+        #   Player's team has no fixture this week — they literally cannot score.
+        #   Hard-override to 0 regardless of what the model predicted.
+        #
+        # DOUBLE GW (has_double_gw=True) + COLD-START model:
+        #   The trained model (vaastav historical data) has seen double GW examples
+        #   and will output a boosted prediction automatically.
+        #   The cold-start heuristic has NO concept of double GWs and underestimates
+        #   by ~40%. Apply 1.75× multiplier only when model is not yet trained.
+        blank_col = df.get("blank_gw", pd.Series(0, index=df.index)).fillna(0).astype(bool)
+        double_col = df.get("double_gw", pd.Series(0, index=df.index)).fillna(0).astype(bool)
+
+        if blank_col.any():
+            blank_vals = blank_col.values
+            xpts_predictions[blank_vals] = 0.0
+            expected_minutes[blank_vals] = 0.0
+            start_probs[blank_vals] = 0.0
+            df.loc[blank_col, "predicted_xpts_next"] = 0.0
+            df.loc[blank_col, "predicted_expected_minutes"] = 0.0
+            df.loc[blank_col, "predicted_start_prob"] = 0.0
+            df.loc[blank_col, "predicted_bench_prob"] = 1.0
+            logger.info(f"Blank GW override: zeroed {blank_vals.sum()} players")
+
+        if double_col.any() and not self.xpts_model.is_trained:
+            double_vals = double_col.values & ~blank_col.values  # don't touch blanks
+            DGW_MULTIPLIER = 1.75
+            xpts_predictions[double_vals] = (xpts_predictions[double_vals] * DGW_MULTIPLIER).clip(max=25.0)
+            df.loc[double_col & ~blank_col, "predicted_xpts_next"] = xpts_predictions[double_vals]
+            logger.info(
+                f"Double GW boost (cold-start): {DGW_MULTIPLIER}× applied to "
+                f"{double_vals.sum()} players"
+            )
+
         # Step 3: Price change predictor
         price_directions, price_confidence = self.price_model.predict(df)
 

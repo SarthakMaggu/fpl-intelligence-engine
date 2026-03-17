@@ -44,7 +44,9 @@ async def get_transfer_suggestions(
     if not current_gw:
         raise HTTPException(404, "No current gameweek found")
 
-    # Get squad picks
+    # Get squad picks — try current GW first, fall back to most recent GW.
+    # During GW transition (current GW just ended, next GW squad not yet synced),
+    # the current GW's squad is used as a proxy for the upcoming GW's squad.
     result = await db.execute(
         select(UserSquad).where(
             UserSquad.team_id == active_team_id,
@@ -53,7 +55,17 @@ async def get_transfer_suggestions(
     )
     picks = result.scalars().all()
     if not picks:
-        raise HTTPException(404, "No squad data. Run /api/squad/sync first.")
+        # GW boundary: fall back to the most recent GW with squad data
+        from sqlalchemy import desc
+        fallback = await db.execute(
+            select(UserSquad)
+            .where(UserSquad.team_id == active_team_id)
+            .order_by(desc(UserSquad.gameweek_id))
+            .limit(15)
+        )
+        picks = fallback.scalars().all()
+    if not picks:
+        raise HTTPException(404, "No squad data. Visit the Squad tab first to sync your team.")
 
     # Get bank data
     result = await db.execute(select(UserBank).where(UserBank.team_id == active_team_id))
