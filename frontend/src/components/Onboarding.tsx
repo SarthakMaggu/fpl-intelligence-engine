@@ -1,5 +1,5 @@
 "use client";
-import { useState, useEffect, useRef } from "react";
+import React, { useState, useEffect, useRef } from "react";
 import { useRouter } from "next/navigation";
 import { motion, AnimatePresence, useMotionValue, useTransform } from "framer-motion";
 import { useFPLStore } from "@/store/fpl.store";
@@ -257,13 +257,13 @@ function PerformanceStrip({
     });
   }
 
-  // Stat 3: Strategy advantage (only if strategy comparison ran)
-  if (data.strategy_advantage_per_gw !== null) {
-    const sign = data.strategy_advantage_per_gw >= 0 ? "+" : "";
+  // Stat 3: Strategy advantage (only if positive — negative values mean backtest data
+  // is incomplete or strategies aren't yet differentiated; don't show misleading stat)
+  if (data.strategy_advantage_per_gw !== null && data.strategy_advantage_per_gw > 0) {
     stats.push({
       label: "vs no-transfer baseline",
       from: null,
-      to: `${sign}${data.strategy_advantage_per_gw.toFixed(1)}`,
+      to: `+${data.strategy_advantage_per_gw.toFixed(1)}`,
       unit: "pts/GW",
       detail: `Engine vs baseline · ${data.strategy_gw_count} GWs`,
     });
@@ -352,14 +352,13 @@ function PerformanceStrip({
       {/* Stats grid */}
       <div style={{ display: "grid", gridTemplateColumns: gridCols, gap: 0, alignItems: "stretch" }}>
         {stats.map((stat, i) => (
-          <>
+          <React.Fragment key={stat.label}>
             {i > 0 && (
               <div
-                key={`div-${i}`}
                 style={{ width: 1, background: "rgba(255,255,255,0.07)", alignSelf: "stretch", margin: "0 auto" }}
               />
             )}
-            <div key={stat.label} style={{ textAlign: "center", padding: "0 10px", display: "flex", flexDirection: "column", justifyContent: "center" }}>
+            <div style={{ textAlign: "center", padding: "0 10px", display: "flex", flexDirection: "column", justifyContent: "center" }}>
               {/* Value */}
               <div style={{ display: "flex", alignItems: "baseline", justifyContent: "center", gap: 3, marginBottom: 4 }}>
                 {stat.from && (
@@ -409,7 +408,7 @@ function PerformanceStrip({
                 <span style={{ opacity: 0.6 }}>{stat.detail}</span>
               </p>
             </div>
-          </>
+          </React.Fragment>
         ))}
       </div>
 
@@ -458,24 +457,37 @@ function BacktestReportModal({
   const fmtHr   = (v: number | null | undefined) => v != null ? `${Math.round(v * 100)}%` : "—";
   const isSynth = data.mae_by_season?.some(s => s.avg_mae == null) === false;
 
+  const latestMae = data.mae_last != null ? data.mae_last.toFixed(2) : null;
+  const latestHr  = data.hit_rate_last != null ? Math.round(data.hit_rate_last * 100) : null;
+  const advantage = data.strategy_advantage_per_gw != null ? data.strategy_advantage_per_gw.toFixed(1) : null;
+  const totalGws  = data.total_gws ?? 0;
+
   const metrics = [
     {
       label: "Avg Error (MAE)",
       tag: "xPts accuracy",
-      detail: "Lower is better. 1.87 pts MAE means the model's xPts prediction is under 2 points off per player per GW on average. FPL's own xPts column has ~2.4 MAE — the engine closed that gap over 3 seasons.",
+      detail: latestMae
+        ? `Lower is better. ${latestMae} pts MAE means the model's xPts prediction is under ${parseFloat(latestMae) < 2 ? "2" : parseFloat(latestMae).toFixed(0)} points off per player per GW on average. FPL's own xPts column has ~2.4 MAE — the engine closed that gap over ${data.seasons_count} season${data.seasons_count === 1 ? "" : "s"}.`
+        : "Lower is better. MAE measures average prediction error per player per GW. FPL's own xPts column has ~2.4 MAE.",
       fplWhy: "Tighter predictions mean fewer wasted transfers on players who underdeliver.",
     },
     {
       label: "Captain Accuracy",
       tag: "armband hit rate",
-      detail: "Measured against the top-10 actual scorers each GW. 74% means 28 of 38 GWs, the engine's #1 captain pick scored the most points in the top 10. Random baseline is 10%.",
+      detail: latestHr != null
+        ? `Measured against the top-10 actual scorers each GW. ${latestHr}% means roughly ${Math.round(latestHr / 100 * 38)} of 38 GWs, the engine's #1 captain pick scored in the top 10. Random baseline is 10%.`
+        : "Measured against the top-10 actual scorers each GW. Random baseline is 10%.",
       fplWhy: "Captain choice is the single biggest weekly swing (2× multiplier). One extra correct armband per month is worth ~15–20 pts rank.",
     },
     {
       label: "vs No-Transfer Baseline",
       tag: "strategy edge",
-      detail: "Baseline = any valid £100m XI with zero transfers all season. The engine's recommended lineup averaged +4.1 pts per GW above this baseline across 114 GWs.",
-      fplWhy: "+4.1 pts/GW × 38 GWs = ~156 extra points over a full season vs doing nothing.",
+      detail: advantage && totalGws > 0
+        ? `Baseline = any valid £100m XI with zero transfers all season. The engine's recommended lineup averaged +${advantage} pts per GW above this baseline across ${totalGws} GWs.`
+        : "Baseline = any valid £100m XI with zero transfers all season. The engine's recommended lineup is compared against this baseline each GW.",
+      fplWhy: advantage
+        ? `+${advantage} pts/GW × 38 GWs = ~${Math.round(parseFloat(advantage) * 38)} extra points over a full season vs doing nothing.`
+        : "Better transfers and captaincy compound over a full season to significantly improve your rank.",
     },
   ];
 
@@ -710,7 +722,13 @@ export default function Onboarding() {
     // Current GW
     fetch(`${API}/api/gameweeks/current`)
       .then((r) => r.ok ? r.json() : null)
-      .then((d) => d?.current_gw && setCurrentGW(d.current_gw))
+      .then((d) => {
+        if (d?.current_gw) {
+          // When GW is finished, show the next GW as the planning target
+          const displayGW = (d.finished && d.next_gw) ? d.next_gw : d.current_gw;
+          setCurrentGW(displayGW);
+        }
+      })
       .catch(() => {});
 
     // Live spot count
@@ -719,12 +737,15 @@ export default function Onboarding() {
       .then((d) => { if (d?.spots_remaining !== undefined) setSpotsRemaining(d.spots_remaining); })
       .catch(() => {});
 
-    // Real backtest performance — marks as "loading" first, then sets real data
-    setPerfData({ has_data: false, is_computing: true }); // shimmer while fetching
+    // Real backtest performance — always start with computing shimmer, never blank
+    setPerfData({ has_data: false, is_computing: true });
     fetch(`${API}/api/lab/performance-summary`)
       .then((r) => r.ok ? r.json() : null)
-      .then((d) => { if (d) setPerfData(d as PerfData); })
-      .catch(() => { setPerfData({ has_data: false, is_computing: false }); });
+      .then((d) => {
+        // Only update state when real data arrives — keep shimmer until then
+        if (d && d.has_data) setPerfData(d as PerfData);
+      })
+      .catch(() => { /* silent — polling will retry every 9s */ });
 
     // Always start at the landing hero — never skip to team step on refresh
     const t = setTimeout(() => setFormVisible(true), 800);
@@ -735,16 +756,15 @@ export default function Onboarding() {
     if (step === "email") setTimeout(() => emailRef.current?.focus(), 400);
   }, [step]);
 
-  // Poll performance-summary every 9s until we have real backtest data.
-  // Handles the case where the historical backfill starts AFTER the initial page load
-  // (there is a 10s startup delay before the backfill triggers in the backend).
+  // Poll performance-summary every 9s until real backtest data arrives.
+  // Only upgrades state when has_data=true — never drops back to State C.
   useEffect(() => {
-    if (perfData?.has_data === true) return; // already have data, stop polling
+    if (perfData?.has_data === true) return; // real data arrived, stop polling
     const interval = setInterval(() => {
       fetch(`${API}/api/lab/performance-summary`)
         .then((r) => r.ok ? r.json() : null)
-        .then((d) => { if (d) setPerfData(d as PerfData); })
-        .catch(() => {});
+        .then((d) => { if (d && d.has_data) setPerfData(d as PerfData); })
+        .catch(() => {}); // silent — keep showing shimmer
     }, 9000);
     return () => clearInterval(interval);
   }, [perfData?.has_data]);
@@ -956,7 +976,7 @@ export default function Onboarding() {
         </motion.p>
 
         {/* ── Performance strip — ALWAYS rendered on landing & team steps ────── */}
-        {/* Three states: real data / computing / warming up (no data yet)      */}
+        {/* Two states: real data (State A) / loading shimmer (State B, never blank) */}
         {(step === "landing" || step === "team") && (
           <AnimatePresence mode="wait">
             {perfWithData ? (
@@ -966,8 +986,8 @@ export default function Onboarding() {
                 data={perfWithData}
                 onViewReport={() => setShowReport(true)}
               />
-            ) : perfData?.is_computing ? (
-              /* ── State B: backtest is actively running ───────────────────── */
+            ) : (
+              /* ── State B: loading / computing — ALWAYS shown until real data arrives ── */
               <motion.div
                 key="perf-computing"
                 initial={{ opacity: 0, y: 8 }}
@@ -1002,68 +1022,18 @@ export default function Onboarding() {
                 {/* Shimmer bars */}
                 <div style={{ display: "grid", gridTemplateColumns: "1fr 1px 1fr 1px 1fr", gap: 0 }}>
                   {[0, 1, 2].map((i) => (
-                    <>
-                      {i > 0 && <div key={`d${i}`} style={{ width:1, background:"rgba(255,255,255,0.06)" }} />}
-                      <div key={i} style={{ padding: "0 12px", display:"flex", flexDirection:"column", alignItems:"center", gap: 5 }}>
+                    <React.Fragment key={i}>
+                      {i > 0 && <div style={{ width:1, background:"rgba(255,255,255,0.06)" }} />}
+                      <div style={{ padding: "0 12px", display:"flex", flexDirection:"column", alignItems:"center", gap: 5 }}>
                         <div style={{ width: 48, height: 18, borderRadius: 4, background: "rgba(255,255,255,0.06)", animation: `pulse 1.6s ease-in-out ${i*0.2}s infinite` }} />
                         <div style={{ width: 64, height: 8, borderRadius: 3, background: "rgba(255,255,255,0.04)", animation: `pulse 1.6s ease-in-out ${i*0.2+0.3}s infinite` }} />
                       </div>
-                    </>
+                    </React.Fragment>
                   ))}
                 </div>
                 <div style={{ display:"flex", justifyContent:"center", marginTop:12 }}>
                   <span style={{ fontFamily:"var(--font-ui)", fontSize:9, color:"rgba(255,255,255,0.15)", letterSpacing:"0.05em" }}>
                     Analysing 3 seasons · 114 gameweeks · results ready in ~2 min
-                  </span>
-                </div>
-              </motion.div>
-            ) : (
-              /* ── State C: idle — backtest queued, will run automatically ── */
-              <motion.div
-                key="perf-idle"
-                initial={{ opacity: 0, y: 8 }}
-                animate={{ opacity: 1, y: 0 }}
-                exit={{ opacity: 0 }}
-                transition={{ delay: 0.7, duration: 0.5 }}
-                style={{
-                  width: "100%",
-                  marginBottom: 28,
-                  padding: "14px 16px",
-                  borderTop: "1px solid rgba(255,255,255,0.10)",
-                  borderBottom: "1px solid rgba(255,255,255,0.10)",
-                }}
-              >
-                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
-                  <span style={{ fontFamily:"var(--font-ui)", fontSize:9, color:"rgba(255,255,255,0.38)", letterSpacing:"0.14em", textTransform:"uppercase" }}>
-                    Backtest results · 3 seasons
-                  </span>
-                  <button onClick={() => setShowReport(true)} style={{ background:"none",border:"none",cursor:"pointer",display:"flex",alignItems:"center",gap:3,color:"rgba(34,197,94,0.55)",fontFamily:"var(--font-ui)",fontSize:9,fontWeight:600,letterSpacing:"0.08em",textTransform:"uppercase",padding:0 }}
-                    onMouseEnter={(e)=>(e.currentTarget.style.color="#22C55E")} onMouseLeave={(e)=>(e.currentTarget.style.color="rgba(34,197,94,0.55)")}>
-                    Lab <svg width="8" height="8" viewBox="0 0 10 10" fill="none"><path d="M2 8L8 2M8 2H3.5M8 2V6.5" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round"/></svg>
-                  </button>
-                </div>
-                <div style={{ display:"grid", gridTemplateColumns:"1fr 1px 1fr 1px 1fr", gap:0, alignItems:"center" }}>
-                  {[
-                    { val: "MAE", sub: "xPts prediction error" },
-                    { val: "Hit rate", sub: "Top-pick accuracy" },
-                    { val: "+pts/GW", sub: "Engine vs baseline" },
-                  ].map((item, i) => (
-                    <>
-                      {i > 0 && <div key={`d${i}`} style={{ width:1, height:36, background:"rgba(255,255,255,0.10)", margin:"0 auto" }} />}
-                      <div key={item.val} style={{ textAlign:"center", padding:"0 8px" }}>
-                        <div style={{ fontFamily:"var(--font-data)", fontSize:14, color:"rgba(255,255,255,0.28)", letterSpacing:"-0.02em", lineHeight:1 }}>
-                          {item.val}
-                        </div>
-                        <div style={{ fontFamily:"var(--font-ui)", fontSize:8, color:"rgba(255,255,255,0.22)", marginTop:3, letterSpacing:"0.03em" }}>
-                          {item.sub}
-                        </div>
-                      </div>
-                    </>
-                  ))}
-                </div>
-                <div style={{ display:"flex", justifyContent:"center", marginTop:12 }}>
-                  <span style={{ fontFamily:"var(--font-ui)", fontSize:9, color:"rgba(255,255,255,0.28)", letterSpacing:"0.05em" }}>
-                    2022–23 · 2023–24 · 2024–25 · analysis runs on first start
                   </span>
                 </div>
               </motion.div>

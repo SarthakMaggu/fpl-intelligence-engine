@@ -67,6 +67,10 @@ interface PlayerMarkerProps {
   onSelect?: (id: number | null) => void;
   isSelected?: boolean;
   large?: boolean;
+  /** True when the current GW is underway (deadline passed, not finished).
+   *  In this state, status='s'/'u' means suspended for the NEXT GW (not this one),
+   *  so we don't dim or label the player as SUSP on the live pitch. */
+  isLiveGw?: boolean;
 }
 
 const POPUP_W = 228;
@@ -80,23 +84,32 @@ export default function PlayerMarker({
   onSelect,
   isSelected,
   large = false,
+  isLiveGw = false,
 }: PlayerMarkerProps) {
   const pos     = POS_CONFIG[pick.element_type] ?? POS_CONFIG[3];
   const nodeSize = isBench ? (large ? 46 : 38) : (large ? 76 : 62);
-  const injured  = pick.status === "i" || pick.status === "d";
-  const opacity  = pick.has_blank_gw ? 0.45 : isBench ? 0.65 : 1;
+  const injured    = pick.status === "i" || pick.status === "d";
+  const suspended  = pick.status === "s" || pick.status === "u";
+  // During a live GW, status='s'/'u' = suspended for the NEXT game (not this one).
+  // Maguire got a red card in GW31 → he played GW31, suspended for GW32.
+  // Don't dim or label SUSP while GW31 is live — his GW31 prediction stands.
+  const suspendedForDisplay = suspended && !isLiveGw;
+  const opacity    = pick.has_blank_gw || suspendedForDisplay ? 0.45 : isBench ? 0.65 : 1;
 
-  const xptsValue = pick.predicted_xpts_next != null
-    ? pick.predicted_xpts_next.toFixed(1)
-    : "—";
+  const xptsNum   = pick.predicted_xpts_next ?? 0;
+  const xptsValue = suspendedForDisplay
+    ? "SUSP"
+    : pick.predicted_xpts_next != null
+      ? pick.predicted_xpts_next.toFixed(1)
+      : "—";
 
-  const xptsNum = pick.predicted_xpts_next ?? 0;
   const xptsColor =
-    isBench                 ? "var(--text-3)" :
-    pick.has_blank_gw       ? "var(--text-3)" :
-    xptsNum >= 6.0          ? "var(--green)"  :
-    xptsNum >= 4.0          ? "var(--amber)"  :
-                              "var(--text-2)";
+    isBench                      ? "var(--text-3)" :
+    pick.has_blank_gw            ? "var(--text-3)" :
+    suspendedForDisplay          ? "var(--text-3)" :
+    xptsNum >= 6.0               ? "var(--green)"  :
+    xptsNum >= 4.0               ? "var(--amber)"  :
+                                   "var(--text-2)";
 
   const nodeRef = useRef<HTMLDivElement>(null);
   // popupAnchor is viewport coords — calculated on click, used by the portal popup
@@ -214,6 +227,17 @@ export default function PlayerMarker({
           </div>
 
           {pick.fdr_next != null && (() => {
+            // fdr_next = 0 means blank GW (no fixture this gameweek)
+            if (pick.fdr_next === 0) {
+              return (
+                <div style={{ textAlign: "center" }}>
+                  <div style={{ display: "inline-flex", alignItems: "center", padding: "4px 9px", borderRadius: 7, background: "rgba(255,255,255,0.04)", color: "var(--text-3)", fontFamily: "var(--font-ui)", fontSize: 11, fontWeight: 600, letterSpacing: "0.06em" }}>
+                    BGW
+                  </div>
+                  <div style={{ fontFamily: "var(--font-ui)", fontSize: 8, color: "var(--text-3)", letterSpacing: "0.06em", marginTop: 2 }}>NO FIXTURE</div>
+                </div>
+              );
+            }
             const fdrColors: Record<number, { bg: string; color: string }> = {
               1: { bg: "rgba(34,197,94,0.20)",   color: "var(--green)" },
               2: { bg: "rgba(34,197,94,0.12)",   color: "var(--green)" },
@@ -316,7 +340,12 @@ export default function PlayerMarker({
               {pick.status === "i" ? "injured" : "doubt"}
             </span>
           )}
-          {pick.suspension_risk && <span className="badge badge-amber" style={{ fontSize: 8 }}>⚠ susp</span>}
+          {suspended && (
+            <span className="badge badge-neg" style={{ fontSize: 8 }}>
+              {isLiveGw ? "susp next GW" : "suspended"}
+            </span>
+          )}
+          {pick.suspension_risk && !suspended && <span className="badge badge-amber" style={{ fontSize: 8 }}>⚠ susp risk</span>}
           {pick.points_per_game != null && (
             <span className="badge badge-muted" style={{ fontSize: 8 }}>{Number(pick.points_per_game).toFixed(1)} ppg</span>
           )}
@@ -489,13 +518,13 @@ export default function PlayerMarker({
 
         {/* xPts label */}
         <div style={{
-          fontFamily: "var(--font-data)",
-          fontSize: isBench ? 10 : 13,
-          fontWeight: 700,
+          fontFamily: suspendedForDisplay ? "var(--font-ui)" : "var(--font-data)",
+          fontSize: isBench ? 9 : suspendedForDisplay ? 10 : 13,
+          fontWeight: suspendedForDisplay ? 600 : 700,
           color: xptsColor,
           marginTop: 5,
           textAlign: "center",
-          letterSpacing: "-0.03em",
+          letterSpacing: suspendedForDisplay ? "0.04em" : "-0.03em",
         }}>
           {xptsValue}
         </div>

@@ -32,9 +32,15 @@ class TransferEvaluateRequest(BaseModel):
 async def get_transfer_suggestions(
     team_context: dict = Depends(get_team_context),
     top_n: int = 5,
+    refresh: bool = False,
     db: AsyncSession = Depends(get_db_session),
 ):
-    """Get top transfer suggestions for current squad."""
+    """Get top transfer suggestions for current squad.
+
+    Results are cached in Redis for 45 minutes per team+GW so repeated page
+    loads don't re-run the ILP solver (expensive) on every visit.
+    Pass ?refresh=true to force recompute (e.g. after a squad sync).
+    """
     active_team_id = team_context["team_id"]
     session = team_context.get("session")
 
@@ -43,6 +49,21 @@ async def get_transfer_suggestions(
     current_gw = result.scalar_one_or_none()
     if not current_gw:
         raise HTTPException(404, "No current gameweek found")
+
+    # ── Redis cache check ──────────────────────────────────────────────────────
+    # Cache key includes GW id so stale data is never served across GW boundaries.
+    # TTL: 45 min — long enough to not recompute on every tab switch,
+    # short enough that post-pipeline updates (hourly) refresh within 2 cycles.
+    _cache_key = f"transfers:suggestions:{active_team_id}:{current_gw.id}"
+    _CACHE_TTL = 45 * 60  # 45 minutes
+    if not refresh:
+        try:
+            import orjson as _orjson
+            cached = await redis_client.get(_cache_key)
+            if cached:
+                return _orjson.loads(cached)
+        except Exception:
+            pass  # Redis unavailable — fall through to live computation
 
     # Get squad picks — try current GW first, fall back to most recent GW.
     # During GW transition (current GW just ended, next GW squad not yet synced),
@@ -471,6 +492,14 @@ async def get_transfer_suggestions(
             team_id=active_team_id,
             changed=payload["decision_engine_shadow"]["changed_top_recommendation"],
         )
+
+    # ── Write to Redis cache ───────────────────────────────────────────────────
+    try:
+        import orjson as _orjson
+        await redis_client.set(_cache_key, _orjson.dumps(payload), ex=_CACHE_TTL)
+    except Exception:
+        pass  # Non-fatal — serve uncached result
+
     return payload
 
 @router.post("/evaluate")

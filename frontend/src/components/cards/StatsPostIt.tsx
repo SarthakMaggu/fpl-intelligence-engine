@@ -183,13 +183,16 @@ export default function StatsPostIt({ intel }: Props) {
                 </div>
               </div>
               <div style={{ display: "flex", gap: 5, flexWrap: "wrap" }}>
-                {cap.fdr_next != null && (
+                {cap.fdr_next != null && cap.fdr_next > 0 && (
                   <span className="badge badge-muted" style={{ fontSize: 9, fontFamily: "var(--font-ui)" }}>
                     FDR {cap.fdr_next}
                   </span>
                 )}
+                {cap.fdr_next === 0 && (
+                  <span className="badge badge-muted" style={{ fontSize: 9, fontFamily: "var(--font-ui)" }}>BGW</span>
+                )}
                 <span className="badge badge-muted" style={{ fontSize: 9 }}>
-                  {cap.is_home_next ? "home" : "away"}
+                  {cap.fdr_next === 0 ? "no fixture" : cap.is_home_next ? "home" : "away"}
                 </span>
                 {cap.confidence_score != null && (
                   <span className="badge badge-muted" style={{ fontSize: 9 }}>
@@ -468,6 +471,61 @@ export default function StatsPostIt({ intel }: Props) {
               </span>
             ))}
           </div>
+        </>
+      )}
+
+      {/* ── 0 Free Transfers advice ─────────────────────────────── */}
+      {intel.free_transfers === 0 && intel.zero_ft_advice && (
+        <>
+          <Divider />
+          <SectionLabel>0 free transfers</SectionLabel>
+
+          {/* Verdict badge */}
+          <div style={{ marginBottom: 10 }}>
+            {intel.zero_ft_advice.verdict === "hold" && (
+              <span className="badge badge-muted" style={{ fontSize: 10 }}>Hold squad — no improvements found</span>
+            )}
+            {intel.zero_ft_advice.verdict === "bench_swap" && (
+              <span className="badge badge-amber" style={{ fontSize: 10 }}>Bench swap available</span>
+            )}
+            {intel.zero_ft_advice.verdict === "chip" && (
+              <span className="badge badge-neg" style={{ fontSize: 10 }}>Chip recommended</span>
+            )}
+          </div>
+
+          {/* Bench swaps */}
+          {intel.zero_ft_advice.bench_swaps.slice(0, 3).map((swap, i) => (
+            <div key={i} style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 6 }}>
+              <div style={{ flex: 1, display: "flex", alignItems: "center", gap: 5, minWidth: 0 }}>
+                {swap.out.team_code && (
+                  <img src={`https://resources.premierleague.com/premierleague/badges/25/t${swap.out.team_code}.png`} alt="" width={12} height={12} style={{ objectFit: "contain", opacity: 0.6 }} onError={(e) => { (e.target as HTMLImageElement).style.display = "none"; }} />
+                )}
+                <span style={{ fontFamily: "var(--font-ui)", fontSize: 11, color: "var(--text-3)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{swap.out.web_name}</span>
+                <span style={{ fontFamily: "var(--font-data)", fontSize: 10, color: "var(--text-3)" }}>{swap.out.xpts.toFixed(1)}</span>
+              </div>
+              <span style={{ fontFamily: "var(--font-ui)", fontSize: 10, color: "var(--text-3)", flexShrink: 0 }}>→</span>
+              <div style={{ flex: 1, display: "flex", alignItems: "center", gap: 5, minWidth: 0 }}>
+                {swap.in.team_code && (
+                  <img src={`https://resources.premierleague.com/premierleague/badges/25/t${swap.in.team_code}.png`} alt="" width={12} height={12} style={{ objectFit: "contain", opacity: 0.85 }} onError={(e) => { (e.target as HTMLImageElement).style.display = "none"; }} />
+                )}
+                <span style={{ fontFamily: "var(--font-ui)", fontSize: 11, fontWeight: 600, color: "var(--text-1)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{swap.in.web_name}</span>
+                <span style={{ fontFamily: "var(--font-data)", fontSize: 10, color: "var(--green)" }}>{swap.in.xpts.toFixed(1)}</span>
+              </div>
+              <span style={{ fontFamily: "var(--font-data)", fontSize: 10, color: "var(--green)", flexShrink: 0 }}>+{swap.gain.toFixed(1)}</span>
+            </div>
+          ))}
+
+          {/* Chip suggestion */}
+          {intel.zero_ft_advice.chip_suggestion && (
+            <div style={{ marginTop: intel.zero_ft_advice.bench_swaps.length > 0 ? 8 : 0, padding: "8px 10px", borderRadius: 8, background: "rgba(239,68,68,0.06)", border: "1px solid rgba(239,68,68,0.18)" }}>
+              <div style={{ fontFamily: "var(--font-ui)", fontSize: 10, fontWeight: 700, color: "var(--red)", textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 3 }}>
+                {intel.zero_ft_advice.chip_suggestion.chip.replace(/_/g, " ")}
+              </div>
+              <div style={{ fontFamily: "var(--font-ui)", fontSize: 11, color: "var(--text-2)", lineHeight: 1.4 }}>
+                {intel.zero_ft_advice.chip_suggestion.reason}
+              </div>
+            </div>
+          )}
         </>
       )}
 

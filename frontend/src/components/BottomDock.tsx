@@ -147,6 +147,7 @@ const DOCK_ITEMS = [
   { href: "/review",   label: "Review",   Icon: IconReview   },
   { href: "/live",     label: "Live",     Icon: IconLive     },
   { href: "/players",  label: "Scout",    Icon: IconScout    },
+  { href: "/status",   label: "Status",   Icon: IconSchedule },
 ];
 
 export default function BottomDock() {

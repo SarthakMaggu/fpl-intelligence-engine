@@ -155,6 +155,34 @@ class DataFetcher:
                         else:
                             raise
 
+                    # ── Free Hit detection ────────────────────────────────────
+                    # Free Hit is a temporary squad for one GW only.  If FH was
+                    # played in squad_gw, the user's real ongoing squad is their
+                    # GW(squad_gw-1) squad — FPL reverts it after the FH GW ends.
+                    # We must NOT store FH picks as the planning squad or every
+                    # GW32 recommendation will be based on the wrong 15 players.
+                    if picks_data and picks_data.get("active_chip") == "freehit":
+                        pre_fh_gw = squad_gw - 1
+                        if pre_fh_gw >= 1:
+                            logger.warning(
+                                f"Free Hit played in GW{squad_gw} — fetching real "
+                                f"squad from pre-FH GW{pre_fh_gw}"
+                            )
+                            await fpl_agent.invalidate_picks_cache(active_team_id, pre_fh_gw)
+                            try:
+                                real_picks = await fpl_agent.get_picks(active_team_id, pre_fh_gw)
+                                # Preserve active_chip so chip-tracking still records FH was played
+                                picks_data = {**real_picks, "active_chip": "freehit"}
+                                logger.info(
+                                    f"Free Hit: using GW{pre_fh_gw} squad "
+                                    f"({len(real_picks.get('picks', []))} players) for GW32 planning"
+                                )
+                            except Exception as fh_err:
+                                logger.error(
+                                    f"Could not fetch pre-FH squad (GW{pre_fh_gw}): {fh_err} "
+                                    f"— proceeding with FH picks (will be wrong)"
+                                )
+
                     entry_data = await fpl_agent.get_entry(active_team_id)
                     history_data = await fpl_agent.get_entry_history(active_team_id)
                     await self.processor.upsert_user_squad(
@@ -302,6 +330,12 @@ class DataFetcher:
             summary["status"] = "complete"
             summary["completed_at"] = datetime.utcnow().isoformat()
             await redis_client.set(LAST_RUN_KEY, summary["completed_at"])
+            # Mark which GW the pipeline last ran for — used by status page to confirm
+            # recommendations are actually ready (not just that the clock passed the sync time)
+            if summary.get("current_gw"):
+                await redis_client.set(
+                    "pipeline:last_gw_run", str(summary["current_gw"]), ex=60 * 60 * 24 * 7
+                )
             logger.info(f"Pipeline complete: {summary}")
 
         except PipelineRunningError:
@@ -314,6 +348,136 @@ class DataFetcher:
             await release_lock(PIPELINE_LOCK_KEY)
 
         return summary
+
+    async def sync_squad_with_pending_transfers(
+        self, team_id: int, next_gw_id: int
+    ) -> dict:
+        """
+        Pre-deadline squad sync — called 5–15 minutes before each GW deadline.
+
+        The FPL API does not expose picks for a future GW until after its deadline.
+        Instead, this method computes the user's PLANNED squad for next_gw_id by:
+          1. Getting the last completed GW's locked picks (their current base squad)
+          2. Fetching entry/{id}/transfers/ and filtering transfers with event=next_gw_id
+          3. Applying OUT/IN pairs to the base squad to get the planned squad
+          4. Upserting the result as the squad for next_gw_id
+
+        This ensures the strategy page shows correct transfer recommendations based
+        on what the user has already planned, not last GW's stale squad.
+
+        Returns a summary dict with squad composition and transfers applied.
+        """
+        try:
+            client = self._get_client()
+            fpl_agent = FPLAgent(client)
+
+            # Invalidate picks cache so we always hit FPL API fresh
+            await fpl_agent.invalidate_picks_cache(team_id, next_gw_id)
+
+            # Step 1: get last completed GW — fall back to next_gw_id - 1
+            last_gw_id = next_gw_id - 1
+            try:
+                picks_data = await fpl_agent.get_picks(team_id, last_gw_id)
+            except Exception:
+                logger.warning(
+                    f"[Pre-deadline sync] team {team_id}: "
+                    f"could not fetch GW{last_gw_id} picks — skipping"
+                )
+                return {"status": "skipped", "reason": f"no picks for GW{last_gw_id}"}
+
+            # Free Hit detection: if the last GW was a Free Hit, those picks are
+            # temporary. The real base squad is the GW before FH (last_gw_id - 1).
+            if picks_data and picks_data.get("active_chip") == "freehit":
+                pre_fh_gw = last_gw_id - 1
+                if pre_fh_gw >= 1:
+                    logger.warning(
+                        f"[Pre-deadline sync] team {team_id}: Free Hit in GW{last_gw_id} "
+                        f"— using pre-FH squad from GW{pre_fh_gw} as base"
+                    )
+                    await fpl_agent.invalidate_picks_cache(team_id, pre_fh_gw)
+                    try:
+                        real_picks = await fpl_agent.get_picks(team_id, pre_fh_gw)
+                        picks_data = {**real_picks, "active_chip": "freehit"}
+                        last_gw_id = pre_fh_gw
+                    except Exception as fh_err:
+                        logger.error(
+                            f"[Pre-deadline sync] team {team_id}: could not fetch "
+                            f"pre-FH GW{pre_fh_gw} picks: {fh_err}"
+                        )
+
+            base_picks = list(picks_data.get("picks", []))
+            base_player_ids = {p["element"] for p in base_picks}
+
+            # Step 2: get all transfers, filter to those planned for next_gw_id
+            try:
+                transfers_data = await fpl_agent.get_transfers(team_id)
+            except Exception:
+                transfers_data = []
+
+            pending = [
+                t for t in (transfers_data or [])
+                if t.get("event") == next_gw_id
+            ]
+
+            # Step 3: apply transfers to get planned squad
+            planned_ids = set(base_player_ids)
+            for t in pending:
+                out_id = t.get("element_out")
+                in_id = t.get("element_in")
+                if out_id and out_id in planned_ids:
+                    planned_ids.discard(out_id)
+                if in_id:
+                    planned_ids.add(in_id)
+
+            # Step 4: build a synthetic picks list for next_gw_id
+            # Preserve position/multiplier from base squad where possible,
+            # add new players with defaults (position=1 bench slot if unknown)
+            base_by_id = {p["element"]: p for p in base_picks}
+            synthetic_picks = []
+            pos = 1
+            for pid in planned_ids:
+                if pid in base_by_id:
+                    synthetic_picks.append({**base_by_id[pid]})
+                else:
+                    synthetic_picks.append({
+                        "element": pid,
+                        "position": pos,
+                        "multiplier": 1,
+                        "is_captain": False,
+                        "is_vice_captain": False,
+                    })
+                pos += 1
+
+            synthetic_picks_data = {
+                **picks_data,
+                "picks": synthetic_picks,
+            }
+
+            # Step 5: upsert the planned squad
+            entry_data = await fpl_agent.get_entry(team_id)
+            history_data = await fpl_agent.get_entry_history(team_id)
+            await self.processor.upsert_user_squad(
+                synthetic_picks_data, entry_data, team_id, next_gw_id, history_data
+            )
+
+            logger.info(
+                f"[Pre-deadline sync] team {team_id} GW{next_gw_id}: "
+                f"{len(synthetic_picks)} players ({len(pending)} pending transfers applied)"
+            )
+            return {
+                "status": "synced",
+                "team_id": team_id,
+                "gw_id": next_gw_id,
+                "base_squad_size": len(base_player_ids),
+                "pending_transfers": len(pending),
+                "planned_squad_size": len(planned_ids),
+            }
+
+        except Exception as e:
+            logger.error(
+                f"[Pre-deadline sync] team {team_id} GW{next_gw_id} failed: {e}"
+            )
+            return {"status": "error", "error": str(e)}
 
     async def run_news_only_pipeline(self) -> dict:
         """Lightweight daily news scrape. Also updates gameweek flags so
@@ -355,7 +519,11 @@ class DataFetcher:
             # Players with 0 season minutes get 0 here, correctly signalling
             # they are frozen out / haven't featured at all.
             season_min = df.get("minutes", pd.Series(0, index=df.index)).fillna(0)
-            df["minutes_last_5_gws"] = (season_min / 38 * 5 * 90).clip(lower=0)
+            # Estimate rolling-5-GW minutes from season total:
+            # avg_minutes_per_gw = season_min / 38; over 5 GWs = * 5
+            # IMPORTANT: do NOT multiply by 90 — minutes are already in minutes.
+            # Old code had "/ 38 * 5 * 90" which gave values 35,000+ (absurd).
+            df["minutes_last_5_gws"] = (season_min * 5 / 38).clip(lower=0)
         if "starts_last_5_gws" not in df.columns:
             season_min = df.get("minutes", pd.Series(0, index=df.index)).fillna(0)
             df["starts_last_5_gws"] = (season_min / 90).clip(0, 5)
@@ -397,34 +565,41 @@ class DataFetcher:
             from agents.oracle_learner import OracleLearner
             _learner = OracleLearner()
             if _learner.bias:
-                _form_mult = _learner.bias.get("form", 1.0)
-                _ppg_mult = _learner.bias.get("points_per_game", 1.0)
-                # Per-player bias: players with above-average form/ppg get boosted more
-                _bias_factor = (_form_mult + _ppg_mult) / 2.0
-                if abs(_bias_factor - 1.0) > 0.001:
-                    # Apply stronger boost to players whose form/ppg is above median
-                    _form_col = df.get("form", pd.Series(0.0, index=df.index)).fillna(0)
-                    _ppg_col = df.get("points_per_game", pd.Series(0.0, index=df.index)).fillna(0)
-                    _form_median = _form_col.median()
-                    _ppg_median = _ppg_col.median()
-                    _above_form = (_form_col > _form_median).values
-                    _above_ppg = (_ppg_col > _ppg_median).values
-                    # Players above both medians get full bias; others get a dampened version
-                    _per_player_bias = np.where(
-                        _above_form & _above_ppg,
-                        _bias_factor,          # full boost: form + ppg star
-                        np.where(
-                            _above_form | _above_ppg,
-                            1.0 + (_bias_factor - 1.0) * 0.5,  # half boost: one signal
-                            1.0,               # no boost: below both medians
-                        )
-                    )
+                # Position-specific multipliers (pos_GK, pos_DEF, pos_MID, pos_FWD)
+                _pos_labels = {1: "GK", 2: "DEF", 3: "MID", 4: "FWD"}
+                _pos_mult_map = {
+                    pos_id: _learner.bias.get(f"pos_{label}", 1.0)
+                    for pos_id, label in _pos_labels.items()
+                }
+                # Per-player boosts (player_{web_name})
+                _player_boosts = {
+                    k.replace("player_", ""): v
+                    for k, v in _learner.bias.items()
+                    if k.startswith("player_")
+                }
+
+                any_active = (
+                    any(abs(v - 1.0) > 0.001 for v in _pos_mult_map.values())
+                    or bool(_player_boosts)
+                )
+                if any_active:
+                    _per_player_bias = np.ones(len(df))
+                    if "element_type" in df.columns:
+                        for pos_id, mult in _pos_mult_map.items():
+                            mask = df["element_type"].values == pos_id
+                            _per_player_bias[mask] *= mult
+                    if _player_boosts and "web_name" in df.columns:
+                        for i, wn in enumerate(df["web_name"].values):
+                            boost = _player_boosts.get(wn, 1.0)
+                            _per_player_bias[i] *= boost
+
                     xpts_predictions = (xpts_predictions * _per_player_bias).clip(min=0)
                     df["predicted_xpts_next"] = xpts_predictions
+                    boosted = int((_per_player_bias > 1.001).sum())
                     logger.info(
-                        f"Oracle bias applied: global={_bias_factor:.3f} "
-                        f"(form_mult={_form_mult:.2f}, ppg_mult={_ppg_mult:.2f}) "
-                        f"boosted {(_per_player_bias > 1.0).sum()} players"
+                        f"Oracle bias applied: pos_multipliers={_pos_mult_map} "
+                        f"player_boosts={len(_player_boosts)} "
+                        f"total_boosted={boosted} players"
                     )
         except Exception as _bias_err:
             logger.warning(f"Oracle bias skipped: {_bias_err}")
@@ -436,20 +611,55 @@ class DataFetcher:
             _cal_raw = await redis_client.get("ml:calibration_map")
             if _cal_raw:
                 _cal_map_raw = _orjson.loads(_cal_raw)
-                # Convert {f"{pos}_{band}": float} → {(pos, band): float}
-                _cal_map = {
-                    (int(k.split("_")[0]), int(k.split("_")[1])): v
-                    for k, v in _cal_map_raw.items()
-                }
-                xpts_predictions = self.xpts_model.apply_calibration(
-                    xpts_predictions, df, _cal_map
-                )
-                df["predicted_xpts_next"] = xpts_predictions
-                logger.info(
-                    f"Calibration applied: {len(_cal_map)} position/price groups"
-                )
+                # Calibration map is stored as {"MID_7": -3.98, "DEF_5": 1.71, ...}
+                # Keys use FPL position name strings, not integer codes.
+                # Map them to int codes that apply_calibration expects: (pos_int, band_int)
+                _POS_STR_TO_INT = {"GK": 1, "DEF": 2, "MID": 3, "FWD": 4}
+                _cal_map: dict = {}
+                for k, v in _cal_map_raw.items():
+                    parts = k.split("_", 1)
+                    if len(parts) != 2:
+                        continue
+                    pos_str, band_str = parts
+                    try:
+                        pos_int = _POS_STR_TO_INT.get(pos_str) or int(pos_str)
+                        band_int = int(band_str)
+                        _cal_map[(pos_int, band_int)] = float(v)
+                    except (ValueError, KeyError):
+                        continue
+                if _cal_map:
+                    xpts_predictions = self.xpts_model.apply_calibration(
+                        xpts_predictions, df, _cal_map
+                    )
+                    df["predicted_xpts_next"] = xpts_predictions
+                    logger.info(
+                        f"Calibration applied: {len(_cal_map)} position/price groups"
+                    )
         except Exception as _cal_err:
             logger.warning(f"Calibration step skipped: {_cal_err}")
+
+        # Step 2d: Apply isotonic calibration (position × price band)
+        # Runs AFTER mean-residual correction as a second refinement pass.
+        # IsotonicRegression learns the non-linear bias shape (e.g. expensive
+        # players being over-predicted) rather than just a flat group offset.
+        # Falls through silently if no calibrators have been fitted yet.
+        try:
+            if self.xpts_model.calibrators:
+                xpts_before_iso = xpts_predictions.copy()
+                xpts_predictions = self.xpts_model.apply_isotonic_calibration(
+                    xpts_predictions, df
+                )
+                df["predicted_xpts_next"] = xpts_predictions
+                delta = float(
+                    (xpts_predictions - xpts_before_iso).mean()
+                )
+                logger.info(
+                    f"Isotonic calibration applied: "
+                    f"{len(self.xpts_model.calibrators)} groups, "
+                    f"mean shift={delta:+.3f} pts"
+                )
+        except Exception as _iso_err:
+            logger.warning(f"Isotonic calibration step skipped: {_iso_err}")
 
         # ── Reality gates: fringe / frozen-out players ───────────────────────
         # The cold-start heuristic estimates start probability purely from price
@@ -574,15 +784,44 @@ class DataFetcher:
                 (pred.player_id, pred.gameweek_id): pred
                 for pred in pred_res.scalars().all()
             }
-            current_gw = int(df.get("gameweek_id", pd.Series(0, index=df.index)).fillna(0).max()) if "gameweek_id" in df.columns else 0
+            # Freeze player-level xPts/start/60min predictions while a GW is live.
+            # During a live GW, in-game events (red cards, injuries) cause the ML model
+            # to predict 0 xPts for the *next* GW — but the pitch should show the
+            # pre-deadline prediction, not a mid-GW update.
+            from models.db.gameweek import Gameweek as _Gameweek
+            _gw_res = await db.execute(select(_Gameweek).where(_Gameweek.is_current == True))
+            _cur_gw = _gw_res.scalar_one_or_none()
+            _nxt_res = await db.execute(select(_Gameweek).where(_Gameweek.is_next == True))
+            _nxt_gw = _nxt_res.scalar_one_or_none()
+
+            # Predictions stored with the GW they are FOR (the upcoming GW),
+            # so calibration can compare prediction(GW N) vs actual(GW N).
+            # Priority: next GW id → current GW id + 1 → df gameweek_id fallback.
+            if _nxt_gw:
+                current_gw = _nxt_gw.id
+            elif _cur_gw:
+                current_gw = _cur_gw.id + 1
+            else:
+                current_gw = int(df.get("gameweek_id", pd.Series(0, index=df.index)).fillna(0).max()) if "gameweek_id" in df.columns else 0
+            gw_underway = _cur_gw is not None and not _cur_gw.finished
+            if gw_underway:
+                logger.info(
+                    f"GW{_cur_gw.id} is underway — player.predicted_xpts_next / "
+                    f"start_prob / 60min_prob frozen at pre-deadline values"
+                )
 
             for i, row in df.iterrows():
                 pid = int(row["id"])
                 player = player_map.get(pid)
                 if player:
-                    player.predicted_xpts_next = round(float(xpts_predictions[i]), 3)
-                    player.predicted_start_prob = round(float(start_probs[i]), 3)
-                    player.predicted_60min_prob = round(float(min60_probs[i]), 3)
+                    # Blank GW players ALWAYS get updated (xPts=0, start_prob=0)
+                    # even while a GW is live — they have no fixture so the value is
+                    # deterministic and must not be left at a stale pre-deadline figure.
+                    is_blank = bool(row.get("blank_gw", False))
+                    if not gw_underway or is_blank:
+                        player.predicted_xpts_next = round(float(xpts_predictions[i]), 3)
+                        player.predicted_start_prob = round(float(start_probs[i]), 3)
+                        player.predicted_60min_prob = round(float(min60_probs[i]), 3)
                     player.predicted_price_direction = int(price_directions[i])
                 pred_key = (pid, current_gw)
                 prediction = existing_predictions.get(pred_key)

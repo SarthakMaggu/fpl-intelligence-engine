@@ -175,7 +175,41 @@ class DataProcessor:
                     ))
             await db.commit()
         logger.debug(f"Upserted {len(fixtures)} fixtures")
+
+        # Update gw_start_time / gw_end_time on every affected Gameweek row.
+        # gw_start_time = MIN(kickoff_time) for that GW
+        # gw_end_time   = MAX(kickoff_time) + 115 minutes (approx full-time of last game)
+        await self._update_gw_timing()
+
         return len(fixtures)
+
+    async def _update_gw_timing(self) -> None:
+        """
+        Compute and persist gw_start_time and gw_end_time on each Gameweek.
+        Called after every upsert_fixtures() so the GW state watcher has
+        accurate kick-off windows without any manual input.
+        """
+        from datetime import timedelta
+        async with AsyncSessionLocal() as db:
+            rows = await db.execute(text("""
+                SELECT gameweek_id,
+                       MIN(kickoff_time) AS first_kickoff,
+                       MAX(kickoff_time) AS last_kickoff
+                FROM fixtures
+                WHERE gameweek_id IS NOT NULL
+                  AND kickoff_time IS NOT NULL
+                GROUP BY gameweek_id
+            """))
+            timing = rows.fetchall()
+
+            for gw_id, first_ko, last_ko in timing:
+                gw = await db.get(Gameweek, gw_id)
+                if gw and first_ko and last_ko:
+                    gw.gw_start_time = first_ko
+                    gw.gw_end_time   = last_ko + timedelta(minutes=115)
+
+            await db.commit()
+        logger.debug(f"GW timing updated for {len(timing)} gameweeks")
 
     # ── Blank/Double GW Detection ──────────────────────────────────────────────
 
@@ -226,16 +260,32 @@ class DataProcessor:
             player_result = await db.execute(select(Player))
             players = player_result.scalars().all()
 
-            # Find current and next GW
+            # Use same GW target logic as _build_next_fixture_lookup:
+            # - If current GW is underway (not finished) → flags for current GW
+            # - Otherwise → flags for next GW
             gw_result = await db.execute(
-                select(Gameweek).where(Gameweek.is_next == True)
+                select(Gameweek).where(Gameweek.is_current == True)
             )
-            next_gw = gw_result.scalar_one_or_none()
-            if not next_gw:
+            current_gw_flag = gw_result.scalar_one_or_none()
+            # Use current GW when it is live (not finished) OR when it is finished
+            # but data hasn't been checked yet (brief transition state between
+            # last game finishing and FPL finalising GW data).  In both cases the
+            # pitch/market should still reflect the CURRENT GW's blank/double flags.
+            gw_fully_resolved = (
+                current_gw_flag is not None
+                and current_gw_flag.finished
+                and current_gw_flag.data_checked
+            )
+            if current_gw_flag and not gw_fully_resolved:
+                # GW underway or in brief post-game / pre-data-checked window
+                next_gw = current_gw_flag
+            else:
                 gw_result = await db.execute(
-                    select(Gameweek).where(Gameweek.is_current == True)
+                    select(Gameweek).where(Gameweek.is_next == True)
                 )
                 next_gw = gw_result.scalar_one_or_none()
+                if not next_gw:
+                    next_gw = current_gw_flag
 
             if next_gw:
                 for player in players:
@@ -260,7 +310,29 @@ class DataProcessor:
         teams_data = {t["id"]: t for t in bootstrap.get("teams", [])}
 
         # Build next fixture lookup: {team_id: {fdr, is_home}}
+        # _build_next_fixture_lookup() returns the CURRENT GW fixtures when a GW
+        # is underway (is_current=True, finished=False), and the NEXT GW fixtures
+        # otherwise. This means fdr_next always reflects the live-GW context, not
+        # next-GW values, while the GW is being played.
         next_fixture_lookup = await self._build_next_fixture_lookup()
+
+        # Detect whether a GW is currently live (deadline passed, not yet resolved).
+        # During this window, fdr_next / is_home_next are FROZEN to prevent the
+        # brief "GW temporarily finished" transition state from writing GW+1 FDR
+        # values while the current GW is still being displayed.
+        # Exception: blank-GW teams (no fixture this GW) ALWAYS get fdr_next=0.
+        gw_underway = False
+        async with AsyncSessionLocal() as _gw_db:
+            _gw_res = await _gw_db.execute(
+                select(Gameweek).where(Gameweek.is_current == True)
+            )
+            _cur_gw = _gw_res.scalar_one_or_none()
+            if _cur_gw and not _cur_gw.finished:
+                gw_underway = True
+                logger.info(
+                    f"GW{_cur_gw.id} is underway — fdr_next / is_home_next frozen "
+                    f"at pre-deadline values (blank-GW teams still get fdr=0)"
+                )
 
         async with AsyncSessionLocal() as db:
             for e in elements:
@@ -283,8 +355,10 @@ class DataProcessor:
 
                 existing = await db.get(Player, player_id)
                 if existing:
-                    # Update all fields
-                    self._update_player_from_element(existing, e, next_fix, news_added, suspension_risk)
+                    self._update_player_from_element(
+                        existing, e, next_fix, news_added, suspension_risk,
+                        gw_underway=gw_underway,
+                    )
                 else:
                     player = Player(
                         id=player_id,
@@ -295,7 +369,10 @@ class DataProcessor:
                         element_type=e.get("element_type", 1),
                         team_id=team_id,
                     )
-                    self._update_player_from_element(player, e, next_fix, news_added, suspension_risk)
+                    self._update_player_from_element(
+                        player, e, next_fix, news_added, suspension_risk,
+                        gw_underway=gw_underway,
+                    )
                     db.add(player)
 
             await db.commit()
@@ -310,6 +387,7 @@ class DataProcessor:
         next_fix: dict,
         news_added: Optional[datetime],
         suspension_risk: bool,
+        gw_underway: bool = False,
     ) -> None:
         """Update player fields from FPL element dict."""
         player.now_cost = e.get("now_cost", 0)
@@ -353,11 +431,21 @@ class DataProcessor:
         player.news_added = news_added
         player.suspension_risk = suspension_risk
 
-        # Fixture context — next_fix is {} for blank GW teams (no upcoming fixture)
-        # FDR defaults to 3 (mid-difficulty) when absent; is_home defaults to False
-        # (not True) so blank-GW players don't misleadingly appear as home games.
-        player.fdr_next = next_fix.get("fdr", 3)
-        player.is_home_next = next_fix.get("is_home", False)
+        # Fixture context — next_fix is {} (empty dict) for blank GW teams.
+        # Use 0 as the sentinel for "no fixture this GW" so the UI can detect
+        # blank GWs. is_home=False for blank GW teams (not at home for any game).
+        # next_fix comes from _build_next_fixture_lookup() which already returns
+        # the live-GW fixtures (not next-GW) when a GW is underway.
+        #
+        # FREEZE during live GW: if the GW is underway AND this team has a fixture,
+        # skip writing fdr_next/is_home_next to prevent the brief "GW transition"
+        # state from corrupting the pre-deadline values with GW+1 data.
+        # Blank-GW teams (no fixture) ALWAYS get fdr=0 written — their absence from
+        # the fixture lookup is deterministic and must not stay at a stale value.
+        has_fixture = bool(next_fix)
+        if not gw_underway or not has_fixture:
+            player.fdr_next = next_fix.get("fdr", 0) if has_fixture else 0
+            player.is_home_next = next_fix.get("is_home", False) if has_fixture else False
 
         # Set piece taker heuristic: top creativity or many assists in team
         player.is_set_piece_taker = player.creativity > 50 or player.assists >= 3
@@ -371,24 +459,49 @@ class DataProcessor:
             player.form_trend = "stable"
 
     async def _build_next_fixture_lookup(self) -> dict[int, dict]:
-        """Build {team_id: {fdr, is_home}} for the next GW."""
-        async with AsyncSessionLocal() as db:
-            # Find next GW
-            result = await db.execute(
-                select(Gameweek).where(Gameweek.is_next == True)
-            )
-            next_gw = result.scalar_one_or_none()
-            if not next_gw:
-                result = await db.execute(
-                    select(Gameweek).where(Gameweek.is_current == True)
-                )
-                next_gw = result.scalar_one_or_none()
+        """Build {team_id: {fdr, is_home}} for the next GW.
 
-            if not next_gw:
+        Priority logic:
+          1. If the current GW is underway (is_current=True AND finished=False)
+             → use that GW's fixtures (deadline has passed, games are live/pending)
+          2. Otherwise (current GW finished OR no current GW)
+             → use is_next=True GW (upcoming GW)
+        This prevents showing GW+1 FDR values while GW is still being played.
+        """
+        async with AsyncSessionLocal() as db:
+            # Check current GW first
+            result = await db.execute(
+                select(Gameweek).where(Gameweek.is_current == True)
+            )
+            current_gw = result.scalar_one_or_none()
+
+            # Use current GW fixtures when:
+            # - GW is actively underway (not finished), OR
+            # - GW just finished but data hasn't been checked yet (transition window)
+            # This prevents the brief "finished=True, data_checked=False" state from
+            # returning GW+1 fixtures while the current GW is still being displayed.
+            gw_fully_resolved = (
+                current_gw is not None
+                and current_gw.finished
+                and current_gw.data_checked
+            )
+            if current_gw and not gw_fully_resolved:
+                # GW is underway or in brief post-game / pre-data-checked window
+                target_gw = current_gw
+            else:
+                # Current GW finished and resolved, OR no current GW — use upcoming GW
+                result = await db.execute(
+                    select(Gameweek).where(Gameweek.is_next == True)
+                )
+                target_gw = result.scalar_one_or_none()
+                if not target_gw:
+                    target_gw = current_gw  # last resort fallback
+
+            if not target_gw:
                 return {}
 
             result = await db.execute(
-                select(Fixture).where(Fixture.gameweek_id == next_gw.id)
+                select(Fixture).where(Fixture.gameweek_id == target_gw.id)
             )
             fixtures = result.scalars().all()
 
@@ -734,6 +847,7 @@ class DataProcessor:
 
                 # Market signals
                 "selected_by_percent": p.selected_by_percent,
+                "transfers_in_event": p.transfers_in_event,
                 "transfers_in_event_delta": p.transfers_in_event - p.transfers_out_event,
 
                 # Win probability (set by odds agent; default to team strength)
@@ -789,26 +903,143 @@ class DataProcessor:
             df["news_article_count"] = 0
 
         # ── Rolling 5-GW performance features ────────────────────────────────
+        # Primary source: player_gw_history (squad players, ~59 entries).
+        # Fallback: player_features_latest (feature store — covers all 825 players
+        #           from the last full pipeline run).  Non-squad transfer targets
+        #           get 0 without this fallback, causing severe under/over-prediction.
+        _rolling_cols = ["xg_last_5_gws", "xa_last_5_gws", "goals_last_5_gws",
+                         "cs_last_5_gws", "pts_last_5_gws", "minutes_trend"]
         try:
             player_ids = df["id"].tolist()
             rolling = await self.get_player_rolling_stats(player_ids, n_gws=5)
             if rolling:
                 rolling_df = pd.DataFrame(rolling).set_index("player_id")
-                for col in ["xg_last_5_gws", "xa_last_5_gws", "goals_last_5_gws",
-                            "cs_last_5_gws", "pts_last_5_gws", "minutes_trend"]:
+                for col in _rolling_cols:
                     if col in rolling_df.columns:
                         df[col] = df["id"].map(rolling_df[col]).fillna(0.0)
                     else:
                         df[col] = 0.0
             else:
-                for col in ["xg_last_5_gws", "xa_last_5_gws", "goals_last_5_gws",
-                            "cs_last_5_gws", "pts_last_5_gws", "minutes_trend"]:
+                for col in _rolling_cols:
                     df[col] = 0.0
         except Exception as _roll_err:
             logger.warning(f"Rolling 5-GW features skipped: {_roll_err}")
-            for col in ["xg_last_5_gws", "xa_last_5_gws", "goals_last_5_gws",
-                        "cs_last_5_gws", "pts_last_5_gws", "minutes_trend"]:
+            for col in _rolling_cols:
                 df[col] = 0.0
+
+        # ── Feature store fallback for non-squad players ──────────────────────
+        # Players absent from player_gw_history (transfer targets not in squad)
+        # get 0 for all rolling stats above.  Fill those gaps from the feature store.
+        try:
+            _zero_mask = (df["pts_last_5_gws"] == 0.0)
+            if _zero_mask.any():
+                from models.db.feature_store import PlayerFeaturesLatest
+                from sqlalchemy import select as _sel2
+                _missing_ids = df.loc[_zero_mask, "id"].tolist()
+                async with AsyncSessionLocal() as _fdb:
+                    _fres = await _fdb.execute(
+                        _sel2(PlayerFeaturesLatest).where(
+                            PlayerFeaturesLatest.player_id.in_(_missing_ids)
+                        )
+                    )
+                    _frows = _fres.scalars().all()
+                if _frows:
+                    import orjson as _orjson2
+                    _fmap: dict = {}
+                    for _fr in _frows:
+                        try:
+                            _fj = _orjson2.loads(_fr.features_json) if isinstance(_fr.features_json, (str, bytes)) else _fr.features_json
+                            _fmap[_fr.player_id] = _fj
+                        except Exception:
+                            pass
+                    for _col in _rolling_cols:
+                        _fallback_vals = df.loc[_zero_mask, "id"].map(
+                            lambda pid: float(_fmap.get(pid, {}).get(_col, 0.0) or 0.0)
+                        )
+                        df.loc[_zero_mask, _col] = df.loc[_zero_mask, _col].where(
+                            df.loc[_zero_mask, _col] != 0.0, _fallback_vals
+                        )
+                    logger.debug(
+                        f"Feature store fallback filled rolling stats for "
+                        f"{sum(_zero_mask)} non-squad players"
+                    )
+        except Exception as _fs_err:
+            logger.warning(f"Feature store rolling-stats fallback skipped: {_fs_err}")
+
+        # ── Season stage — GW position normalised to [0, 1] ──────────────────
+        # Computed from current GW id stored in the gameweek table.
+        # Pre-announced fixture info: no leakage.
+        try:
+            from models.db.gameweek import Gameweek
+            from sqlalchemy import select as _sel
+            from core.database import AsyncSessionLocal as _ASL
+            async with _ASL() as _db:
+                _gw_res = await _db.execute(
+                    _sel(Gameweek.id).where(Gameweek.is_next == True)
+                )
+                _next_gw_id = _gw_res.scalar() or 1
+            df["season_stage"] = round(min(max((_next_gw_id - 1) / 37.0, 0.0), 1.0), 4)
+        except Exception:
+            df["season_stage"] = 0.5  # mid-season neutral fallback
+
+        # ── opponent_goals_conceded_per90 — derived from fdr_next ─────────────
+        # This feature IS trained on (historical_fetcher computes it from rolling
+        # opponent goals conceded). At inference it was previously missing (defaulted
+        # to 0.0 = "opponent never concedes", biasing xPts upward for all players).
+        # FIX: approximate from fdr_next using FPL's difficulty scale:
+        #   FDR 1 (easiest) → opponent concedes ~2.0/game (leaky defence)
+        #   FDR 3 (neutral) → ~1.3/game (Premier League average)
+        #   FDR 5 (hardest) → ~0.6/game (top defensive side)
+        #   FDR 0 (blank GW) → 0.0 (no fixture)
+        import numpy as _np
+        _fdr = df["fdr_next"].fillna(3).values.astype(float)
+        df["opponent_goals_conceded_per90"] = _np.select(
+            [_fdr == 0, _fdr == 1, _fdr == 2, _fdr == 4, _fdr == 5],
+            [0.0,        2.0,       1.7,       0.9,       0.6],
+            default=1.3,   # FDR 3 = average Premier League attack difficulty
+        )
+
+        # ── fdr_next3_avg — 3-GW avg FDR (from fixture table) ────────────────
+        # Computed from upcoming fixture FDR data.  If unavailable, fall back
+        # to the current fdr_next (single-GW proxy).  This feature has low
+        # predictive weight in the model (team-level signal already in fdr_next)
+        # but must not default to 0 (implies impossibly easy run of fixtures).
+        if "fdr_next3_avg" not in df.columns:
+            df["fdr_next3_avg"] = df["fdr_next"].fillna(3.0)
+
+        # ── Normalize transfers_in_event_delta by total GW volume ────────────
+        # Raw FPL counts (0 – 500,000) had the same scale mismatch pattern as
+        # selected_by_percent.  More critically: the model learned
+        # "very high raw delta → regression" from training data (players with
+        # 100k+ transfers in had just hauled → often regress next GW).
+        # This caused elite in-form players (Bruno Fernandes, Salah) to receive
+        # LOWER predictions than mediocre players because massive bandwagon buying
+        # after a haul was interpreted as a regression anchor.
+        #
+        # Fix: normalise by total GW transfers volume → percentage of market
+        # activity directed at this player.  Bounded range ≈ -10 to +10.
+        # Bruno at 107k / ~1M total GW transfers = +10.7% (genuinely popular).
+        # This matches the training-data normalised distribution and lets the
+        # model see "market flow %" as the intended buying-pressure signal.
+        if "transfers_in_event_delta" in df.columns:
+            _raw_ti = df["transfers_in_event"].fillna(0) if "transfers_in_event" in df.columns else df["transfers_in_event_delta"].clip(lower=0)
+            _total_ti = _raw_ti.sum() or 1.0
+            df["transfers_in_event_delta"] = (
+                df["transfers_in_event_delta"] / _total_ti * 100
+            ).clip(-10, 10)
+
+        # Log-compress selected_by_percent to match training distribution.
+        # Training: log1p applied after computing %; must mirror here at inference.
+        # This reduces feature importance from 2nd → ~15th while keeping signal.
+        if "selected_by_percent" in df.columns:
+            import numpy as _np_sel2
+            df["selected_by_percent"] = _np_sel2.log1p(df["selected_by_percent"].fillna(0))
+
+        # Cap pts_last_5_gws to match training cap (40 pts max).
+        # Prevents extreme outliers (e.g. Bruno 46pts) from triggering model's
+        # regression-to-mean pattern. Monotone +1 constraint + cap = correct direction.
+        if "pts_last_5_gws" in df.columns:
+            df["pts_last_5_gws"] = df["pts_last_5_gws"].clip(upper=40)
 
         return df
 

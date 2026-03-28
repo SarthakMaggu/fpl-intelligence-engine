@@ -1,10 +1,8 @@
 "use client";
-import { useState } from "react";
-import { motion, AnimatePresence } from "framer-motion";
-import { CheckCircle, XCircle, Zap, ArrowLeftRight, User, Shield, TrendingUp } from "lucide-react";
+import React, { useState } from "react";
+import { motion } from "framer-motion";
+import { ArrowLeftRight, Shield, Zap, TrendingUp } from "lucide-react";
 import type { PriorityAction, PriorityActions, ActionType, ActionUrgency } from "@/types/fpl";
-
-const API = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
 // ── Colors per action type ─────────────────────────────────────────────────
 const TYPE_COLOR: Record<ActionType | string, string> = {
@@ -16,8 +14,7 @@ const TYPE_COLOR: Record<ActionType | string, string> = {
   bench_swap: "var(--green)",
 };
 
-const TYPE_ICON: Record<ActionType | string, React.ElementType> = {
-  captain:    User,
+const TYPE_ICON: Partial<Record<ActionType | string, React.ElementType>> = {
   transfer:   ArrowLeftRight,
   injury:     Shield,
   chip:       Zap,
@@ -37,152 +34,113 @@ const URGENCY_COLOR: Record<ActionUrgency, string> = {
   LOW:    "var(--text-3)",
 };
 
-// ── Single action card ──────────────────────────────────────────────────────
+// ── Team badge — small club crest ─────────────────────────────────────────
+function TeamBadge({ code, size = 14 }: { code: number; size?: number }) {
+  return (
+    <img
+      src={`https://resources.premierleague.com/premierleague/badges/25/t${code}.png`}
+      alt=""
+      width={size} height={size}
+      style={{ objectFit: "contain", flexShrink: 0 }}
+      onError={(e) => { (e.target as HTMLImageElement).style.display = "none"; }}
+    />
+  );
+}
+
+// ── Single action card — READ ONLY ─────────────────────────────────────────
 function ActionCard({
   action,
-  teamId,
-  gameweek,
-  onDone,
-  onSkip,
   isBest,
 }: {
   action: PriorityAction;
-  teamId: number | null;
-  gameweek: number;
-  onDone: () => void;
-  onSkip: () => void;
   isBest?: boolean;
 }) {
-  const [logging, setLogging] = useState<"done" | "skip" | null>(null);
   const color = TYPE_COLOR[action.type] || "var(--text-2)";
-  const Icon = TYPE_ICON[action.type] || Zap;
-
-  const logDecision = async (followed: boolean) => {
-    setLogging(followed ? "done" : "skip");
-    try {
-      // Create decision log entry
-      const createRes = await fetch(`${API}/api/decisions/`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          team_id: teamId || 0,
-          gameweek_id: gameweek,
-          decision_type: action.decision_type,
-          recommended_option: action.recommended_option,
-          expected_points: action.impact_value,
-          reasoning: action.reasoning,
-        }),
-      });
-      if (createRes.ok) {
-        const created = await createRes.json();
-        // Immediately patch with user choice
-        await fetch(`${API}/api/decisions/${created.id}`, {
-          method: "PATCH",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            user_choice: followed ? action.recommended_option : "SKIPPED",
-            decision_followed: followed,
-          }),
-        });
-      }
-    } catch { /* silent — UI still updates optimistically */ }
-    // Optimistic update
-    if (followed) onDone();
-    else onSkip();
-  };
+  const Icon = TYPE_ICON[action.type] ?? null;
+  const isTransfer = action.type === "transfer" || action.type === "bench_swap";
 
   return (
     <motion.div
       layout
-      initial={{ opacity: 0, y: -8 }}
+      initial={{ opacity: 0, y: -6 }}
       animate={{ opacity: 1, y: 0 }}
-      exit={{ opacity: 0, x: -20, height: 0, marginBottom: 0, padding: 0 }}
       transition={{ type: "spring", stiffness: 300, damping: 28 }}
       style={{
-        background: isBest
-          ? `rgba(${color === "var(--red)" ? "239,68,68" : color === "var(--amber)" ? "245,158,11" : color === "var(--blue)" ? "59,130,246" : "34,197,94"}, 0.08)`
-          : `rgba(${color === "var(--red)" ? "239,68,68" : color === "var(--amber)" ? "245,158,11" : color === "var(--blue)" ? "59,130,246" : "34,197,94"}, 0.04)`,
-        border: isBest ? `1px solid ${color}55` : `1px solid ${color}26`,
+        background: "rgba(255,255,255,0.025)",
+        border: "1px solid var(--divider)",
         borderLeft: `3px solid ${color}`,
         borderRadius: 10,
-        padding: "10px 12px",
-        marginBottom: 8,
+        padding: "9px 11px",
+        marginBottom: 7,
         position: "relative",
         overflow: "hidden",
-        boxShadow: isBest ? `0 0 24px ${color}18` : undefined,
       }}
     >
       {/* BEST PLAY watermark */}
       {isBest && (
         <div style={{
           position: "absolute", inset: 0, display: "flex", alignItems: "center",
-          justifyContent: "flex-end", paddingRight: 12, pointerEvents: "none", opacity: 0.05,
+          justifyContent: "flex-end", paddingRight: 12, pointerEvents: "none", opacity: 0.04,
         }}>
-          <span style={{ fontFamily: "var(--font-display)", fontSize: 56, fontWeight: 700, color, whiteSpace: "nowrap", letterSpacing: "-0.03em" }}>BEST</span>
+          <span style={{ fontFamily: "var(--font-display)", fontSize: 52, fontWeight: 700, color, whiteSpace: "nowrap", letterSpacing: "-0.03em" }}>BEST</span>
         </div>
       )}
 
-      {/* Priority + Type header */}
-      <div style={{ display: "flex", alignItems: "center", gap: 7, marginBottom: 6 }}>
-        <span
-          style={{
-            fontFamily: "var(--font-data)",
-            fontSize: 10,
-            fontWeight: 700,
-            color: color,
-            minWidth: 14,
-          }}
-        >
+      {/* Header row: priority · icon · logos · urgency · impact */}
+      <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 5 }}>
+        {/* Priority number */}
+        <span style={{ fontFamily: "var(--font-data)", fontSize: 10, fontWeight: 700, color, minWidth: 12, flexShrink: 0 }}>
           {action.priority}
         </span>
-        <Icon size={11} strokeWidth={2} style={{ color, flexShrink: 0 }} />
+
+        {/* Type icon */}
+        {Icon && <Icon size={11} strokeWidth={2} style={{ color, flexShrink: 0 }} />}
+
+        {/* Team badges — for transfers show OUT → IN; for others show single badge */}
+        {isTransfer && action.player_out_team_code && action.team_code ? (
+          <div style={{ display: "flex", alignItems: "center", gap: 3, flexShrink: 0 }}>
+            <TeamBadge code={action.player_out_team_code} />
+            <span style={{ fontSize: 8, color: "var(--text-3)" }}>→</span>
+            <TeamBadge code={action.team_code} />
+          </div>
+        ) : isTransfer && (action.player_out_team_code || action.team_code) ? (
+          <TeamBadge code={(action.player_out_team_code || action.team_code)!} />
+        ) : !isTransfer && action.team_code ? (
+          <TeamBadge code={action.team_code} />
+        ) : null}
+
+        {/* BEST PLAY badge */}
         {isBest && (
           <span style={{
             fontFamily: "var(--font-ui)", fontSize: 8, fontWeight: 700,
-            color, background: `${color}22`, border: `1px solid ${color}44`,
-            borderRadius: 999, padding: "1px 6px", letterSpacing: "0.08em",
-          }}>BEST PLAY</span>
+            color, background: `${color}1a`, border: `1px solid ${color}33`,
+            borderRadius: 999, padding: "1px 5px", letterSpacing: "0.07em", flexShrink: 0,
+          }}>BEST</span>
         )}
-        <span
-          style={{
-            fontFamily: "var(--font-ui)",
-            fontSize: 9,
-            fontWeight: 700,
-            color: URGENCY_COLOR[action.urgency],
-            letterSpacing: "0.1em",
-            textTransform: "uppercase",
-          }}
-        >
+
+        {/* Urgency */}
+        <span style={{
+          fontFamily: "var(--font-ui)", fontSize: 9, fontWeight: 700,
+          color: URGENCY_COLOR[action.urgency], letterSpacing: "0.08em",
+          textTransform: "uppercase", flexShrink: 0,
+        }}>
           {URGENCY_LABEL[action.urgency]}
         </span>
-        {/* Impact */}
+
+        {/* Impact — pushed right */}
         <div style={{ marginLeft: "auto", textAlign: "right", flexShrink: 0 }}>
-          <span
-            style={{
-              fontFamily: "var(--font-data)",
-              fontSize: 14,
-              fontWeight: 700,
-              color,
-              letterSpacing: "-0.03em",
-            }}
-          >
+          <span style={{ fontFamily: "var(--font-data)", fontSize: 13, fontWeight: 700, color, letterSpacing: "-0.03em" }}>
             +{action.impact_value}
           </span>
-          <span
-            style={{
-              fontFamily: "var(--font-ui)",
-              fontSize: 8,
-              color: "var(--text-3)",
-              marginLeft: 3,
-            }}
-          >
+          <span style={{ fontFamily: "var(--font-ui)", fontSize: 8, color: "var(--text-3)", marginLeft: 2 }}>
             {action.impact_label}
           </span>
         </div>
       </div>
 
+      {/* Confidence / risk badges */}
       {(action.confidence_score != null || action.risk_profile) && (
-        <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 6 }}>
+        <div style={{ display: "flex", gap: 5, flexWrap: "wrap", marginBottom: 5 }}>
           {action.confidence_score != null && (
             <span className="badge badge-muted" style={{ fontSize: 9 }}>
               {action.confidence_score}% conf
@@ -197,164 +155,58 @@ function ActionCard({
       )}
 
       {/* Label */}
-      <div
-        style={{
-          fontFamily: "var(--font-ui)",
-          fontSize: 13,
-          fontWeight: 600,
-          color: "var(--text-1)",
-          letterSpacing: "-0.01em",
-          marginBottom: 4,
-          overflow: "hidden",
-          textOverflow: "ellipsis",
-          whiteSpace: "nowrap",
-        }}
-      >
+      <div style={{
+        fontFamily: "var(--font-ui)", fontSize: 13, fontWeight: 600,
+        color: "var(--text-1)", letterSpacing: "-0.01em", marginBottom: 3,
+        overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
+      }}>
         {action.label}
       </div>
 
       {/* Reasoning */}
-      <div
-        style={{
-          fontFamily: "var(--font-ui)",
-          fontSize: 10,
-          color: "var(--text-3)",
-          lineHeight: 1.35,
-          marginBottom: 9,
-          overflow: "hidden",
-          display: "-webkit-box",
-          WebkitLineClamp: 2,
-          WebkitBoxOrient: "vertical",
-        }}
-      >
+      <div style={{
+        fontFamily: "var(--font-ui)", fontSize: 10, color: "var(--text-3)",
+        lineHeight: 1.35, overflow: "hidden",
+        display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical",
+      }}>
         {action.explanation_summary || action.reasoning}
-      </div>
-
-      {/* DONE / SKIP buttons */}
-      <div style={{ display: "flex", gap: 6 }}>
-        <motion.button
-          whileHover={{ scale: 1.03 }}
-          whileTap={{ scale: 0.97 }}
-          disabled={logging !== null}
-          onClick={() => logDecision(true)}
-          style={{
-            flex: 1,
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-            gap: 5,
-            padding: "5px 0",
-            borderRadius: 7,
-            border: "1px solid rgba(34,197,94,0.3)",
-            background: logging === "done" ? "rgba(34,197,94,0.15)" : "rgba(34,197,94,0.06)",
-            color: "var(--green)",
-            fontFamily: "var(--font-ui)",
-            fontSize: 10,
-            fontWeight: 600,
-            cursor: logging !== null ? "default" : "pointer",
-            letterSpacing: "0.06em",
-            transition: "all 150ms",
-          }}
-        >
-          <CheckCircle size={10} />
-          {logging === "done" ? "LOGGED" : "DONE"}
-        </motion.button>
-
-        <motion.button
-          whileHover={{ scale: 1.03 }}
-          whileTap={{ scale: 0.97 }}
-          disabled={logging !== null}
-          onClick={() => logDecision(false)}
-          style={{
-            flex: 1,
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-            gap: 5,
-            padding: "5px 0",
-            borderRadius: 7,
-            border: "1px solid var(--divider)",
-            background: logging === "skip" ? "rgba(255,255,255,0.05)" : "transparent",
-            color: logging === "skip" ? "var(--text-2)" : "var(--text-3)",
-            fontFamily: "var(--font-ui)",
-            fontSize: 10,
-            fontWeight: 600,
-            cursor: logging !== null ? "default" : "pointer",
-            letterSpacing: "0.06em",
-            transition: "all 150ms",
-          }}
-        >
-          <XCircle size={10} />
-          {logging === "skip" ? "NOTED" : "SKIP"}
-        </motion.button>
       </div>
     </motion.div>
   );
 }
 
-// ── localStorage helpers — persist dismissed per gameweek ──────────────────
-const STORAGE_KEY = "fpl_brief_dismissed";
-
-function loadDismissed(gameweek: number): Set<number> {
-  try {
-    const raw = typeof window !== "undefined" ? localStorage.getItem(STORAGE_KEY) : null;
-    if (!raw) return new Set();
-    const parsed = JSON.parse(raw) as Record<string, number[]>;
-    return new Set(parsed[String(gameweek)] ?? []);
-  } catch {
-    return new Set();
-  }
-}
-
-function saveDismissed(gameweek: number, dismissed: Set<number>) {
-  try {
-    const raw = typeof window !== "undefined" ? localStorage.getItem(STORAGE_KEY) : null;
-    const parsed: Record<string, number[]> = raw ? JSON.parse(raw) : {};
-    parsed[String(gameweek)] = Array.from(dismissed);
-    // Prune old GWs (keep only last 3)
-    const keys = Object.keys(parsed).map(Number).sort((a, b) => b - a);
-    keys.slice(3).forEach(k => delete parsed[String(k)]);
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(parsed));
-  } catch { /* silent */ }
-}
-
 // ── Main ActionBrief component ─────────────────────────────────────────────
 export default function ActionBrief({
   brief,
-  teamId,
 }: {
   brief: PriorityActions;
   teamId: number | null;
 }) {
-  const [dismissed, setDismissed] = useState<Set<number>>(() => loadDismissed(brief.gameweek));
-
-  const dismiss = (priority: number) => {
-    setDismissed(prev => {
-      const next = new Set(prev).add(priority);
-      saveDismissed(brief.gameweek, next);
-      return next;
-    });
-  };
-
-  const visible = brief.actions.filter((a) => !dismissed.has(a.priority));
-
-  if (visible.length === 0) {
+  // GW is underway — squad locked, no actions possible
+  if (brief.gw_state === "underway") {
     return (
       <motion.div
-        initial={{ opacity: 0 }}
-        animate={{ opacity: 1 }}
-        style={{
-          padding: "14px 16px",
-          textAlign: "center",
-          color: "var(--text-3)",
-          fontFamily: "var(--font-ui)",
-          fontSize: 11,
-        }}
+        initial={{ opacity: 0, x: -16 }}
+        animate={{ opacity: 1, x: 0 }}
+        transition={{ type: "spring", stiffness: 240, damping: 26 }}
+        className="glass"
+        style={{ borderRadius: 14, padding: "14px 14px 12px", marginBottom: 10 }}
       >
-        ✓ All actions logged for GW{brief.gameweek}
+        <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
+          <span style={{ width: 6, height: 6, borderRadius: "50%", background: "var(--amber)", display: "inline-block", flexShrink: 0 }} />
+          <span style={{ fontFamily: "var(--font-display)", fontSize: 15, fontWeight: 600, color: "var(--text-1)", letterSpacing: "-0.02em" }}>
+            GW{brief.gameweek} Underway
+          </span>
+        </div>
+        <p style={{ fontFamily: "var(--font-ui)", fontSize: 11, color: "var(--text-3)", lineHeight: 1.55, margin: 0 }}>
+          Squad locked · fixtures in play · no transfers or changes possible.<br />
+          Check the <strong style={{ color: "var(--text-2)" }}>Live Score</strong> tab for real-time points.
+        </p>
       </motion.div>
     );
   }
+
+  if (!brief.actions.length) return null;
 
   return (
     <motion.div
@@ -362,74 +214,40 @@ export default function ActionBrief({
       animate={{ opacity: 1, x: 0 }}
       transition={{ type: "spring", stiffness: 240, damping: 26 }}
       className="glass"
-      style={{ borderRadius: 16, padding: "14px 14px 10px", marginBottom: 10 }}
+      style={{ borderRadius: 14, padding: "12px 12px 8px", marginBottom: 10 }}
     >
       {/* Header */}
-      <div
-        style={{
-          display: "flex",
-          justifyContent: "space-between",
-          alignItems: "center",
-          marginBottom: 12,
-        }}
-      >
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
         <div>
-          <span
-            style={{
-              fontFamily: "var(--font-display)",
-              fontSize: 16,
-              fontWeight: 600,
-              color: "var(--text-1)",
-              letterSpacing: "-0.02em",
-            }}
-          >
+          <span style={{
+            fontFamily: "var(--font-display)", fontSize: 15, fontWeight: 600,
+            color: "var(--text-1)", letterSpacing: "-0.02em",
+          }}>
             GW{brief.gameweek} Brief
           </span>
-          <span
-            style={{
-              display: "block",
-              fontFamily: "var(--font-ui)",
-              fontSize: 9,
-              color: "var(--text-3)",
-              marginTop: 1,
-              letterSpacing: "0.06em",
-              textTransform: "uppercase",
-            }}
-          >
-            {brief.free_transfers} free transfer{brief.free_transfers !== 1 ? "s" : ""} · {visible.length} action{visible.length !== 1 ? "s" : ""}
+          <span style={{
+            display: "block", fontFamily: "var(--font-ui)", fontSize: 9,
+            color: "var(--text-3)", marginTop: 1, letterSpacing: "0.06em",
+            textTransform: "uppercase",
+          }}>
+            {brief.free_transfers} FT · {brief.actions.length} action{brief.actions.length !== 1 ? "s" : ""}
           </span>
         </div>
-        <span
-          style={{
-            fontFamily: "var(--font-ui)",
-            fontSize: 9,
-            fontWeight: 600,
-            color: "var(--text-3)",
-            letterSpacing: "0.12em",
-            textTransform: "uppercase",
-            padding: "3px 8px",
-            border: "1px solid var(--divider)",
-            borderRadius: 999,
-          }}
-        >
+        <span style={{
+          fontFamily: "var(--font-ui)", fontSize: 9, fontWeight: 600,
+          color: "var(--text-3)", letterSpacing: "0.12em", textTransform: "uppercase",
+          padding: "2px 7px", border: "1px solid var(--divider)", borderRadius: 999,
+        }}>
           priority
         </span>
       </div>
 
       {/* Action cards */}
-      <AnimatePresence mode="popLayout">
-        {visible.map((action, idx) => (
-          <ActionCard
-            key={action.priority}
-            action={action}
-            teamId={teamId}
-            gameweek={brief.gameweek}
-            onDone={() => dismiss(action.priority)}
-            onSkip={() => dismiss(action.priority)}
-            isBest={idx === 0}
-          />
+      <div>
+        {brief.actions.map((action, idx) => (
+          <ActionCard key={action.priority} action={action} isBest={idx === 0} />
         ))}
-      </AnimatePresence>
+      </div>
     </motion.div>
   );
 }

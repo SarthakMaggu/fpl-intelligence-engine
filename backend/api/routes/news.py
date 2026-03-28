@@ -153,6 +153,12 @@ async def retrain_model():
             async with HistoricalFetcher() as fetcher:
                 metrics = await fetcher.retrain_xpts_model()
             logger.info(f"Manual retrain complete: {metrics}")
+            # Reload the in-memory xPts model so the running fetcher immediately
+            # uses the new artifact (without this, predictions stay stale until restart).
+            from data_pipeline.scheduler import _fetcher as _sched_fetcher
+            if _sched_fetcher is not None and hasattr(_sched_fetcher, "xpts_model"):
+                _sched_fetcher.xpts_model._load()
+                logger.info("In-memory xPts model reloaded after retrain")
         except Exception as e:
             logger.error(f"Manual retrain failed: {e}")
 

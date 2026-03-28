@@ -95,5 +95,8 @@ if [ "${WORKER}" = "true" ]; then
 else
     APP_PORT="${PORT:-8000}"
     echo "[app] Starting uvicorn on port $APP_PORT"
-    exec uvicorn main:app --host 0.0.0.0 --port "$APP_PORT" --workers 2
+    # Single worker required: APScheduler is in-process and must not run in multiple
+    # workers simultaneously (causes double job execution + jobs endpoint returns 0
+    # when the load balancer routes to the worker that "didn't" own the scheduler instance).
+    exec uvicorn main:app --host 0.0.0.0 --port "$APP_PORT" --workers 1
 fi

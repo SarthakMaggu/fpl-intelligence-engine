@@ -43,6 +43,7 @@ import models.db.background_job     # noqa: F401
 import models.db.historical_gw_stats  # noqa: F401
 # Multi-competition fixture store (PL + UCL + FAC + UEL)
 import models.db.competition_fixture  # noqa: F401
+import models.db.admin                # noqa: F401  — AdminUser table
 
 from services.metrics_service import metrics_registry
 
@@ -97,6 +98,15 @@ async def lifespan(app: FastAPI):
         ("decision_log", "explanation_summary",     "TEXT"),
         ("decision_log", "inputs_used_json",        "TEXT"),
         ("decision_log", "simulation_summary_json", "TEXT"),
+        # Decision-specific gain/loss tracking (per-player outcome, not team total)
+        ("decision_log", "player_id_primary",   "INTEGER"),
+        ("decision_log", "player_id_secondary",  "INTEGER"),
+        ("decision_log", "actual_gain",          "FLOAT"),
+        # GW timing — first and last fixture kick-off times per GW
+        # Used by GW state watcher for event-driven pipeline triggers and
+        # GW-live detection (replaces deadline_time-based heuristic)
+        ("gameweeks", "gw_start_time", "TIMESTAMP"),
+        ("gameweeks", "gw_end_time",   "TIMESTAMP"),
     ]
     async with engine.begin() as conn:
         for tbl, col, col_type in _new_cols:
@@ -428,7 +438,7 @@ async def _auto_trigger_historical_backfill_if_needed(http_client) -> None:
         # fake data, so count > 0 is NOT sufficient to skip training — the model
         # file would still be missing. We must also verify the artifact exists.
         from pathlib import Path as _Path
-        _MODEL_PATH = _Path("/app/models/ml/artifacts/xpts_lgbm.pkl")
+        _MODEL_PATH = _Path("/app/models/ml/artifacts/xpts_model.pkl")
         model_trained = _MODEL_PATH.exists()
 
         if count > 0 and model_trained:
@@ -437,6 +447,9 @@ async def _auto_trigger_historical_backfill_if_needed(http_client) -> None:
                 f"model artifact is present at {_MODEL_PATH}"
             )
             try:
+                # Ensure the status key reflects reality — it may have been left as
+                # "computing" if a previous run was interrupted before completion.
+                await redis_client.set("backfill:status", "complete")
                 await redis_client.delete(_LOCK_KEY)
             except Exception:
                 pass
@@ -621,10 +634,14 @@ import json as _json
 _HEAVY_ENDPOINTS = {
     "/api/optimization/squad",
     "/api/oracle/compute",
-    "/api/oracle/auto-resolve",   # ILP + FPL API calls — expensive
-    "/api/transfers/suggestions",
+    # transfers/suggestions is NOT heavy — it has its own Redis cache in the route
+    # so repeated page loads hit the cache (< 1ms) rather than running the ILP solver.
     "/api/lab/run-backtest",
 }
+# auto-resolve is called automatically on every oracle page load AND by the scheduler.
+# It uses a separate, more generous per-hour limit instead of the 10/day bucket so that
+# it never blocks page loads or automatic GW resolution after a GW ends.
+_AUTO_RESOLVE_MAX_PER_HOUR = 20
 
 # Squad sync cooldown: 30 seconds per team (prevents spam resyncing)
 _SYNC_COOLDOWN_SECONDS = 30
@@ -672,6 +689,20 @@ async def rate_limit_middleware(request, call_next):
                 if heavy_count > settings.MAX_HEAVY_REQUESTS_PER_DAY:
                     return JSONResponse(
                         {"error": f"Daily heavy request limit reached (max {settings.MAX_HEAVY_REQUESTS_PER_DAY}/day per team)"},
+                        status_code=429,
+                    )
+
+        # auto-resolve: generous per-hour limit (called automatically on page load)
+        if request.url.path == "/api/oracle/auto-resolve":
+            team_id = request.query_params.get("team_id")
+            if team_id:
+                ar_key = f"rate:team:{team_id}:auto_resolve:hour"
+                ar_count = await redis_client.incr(ar_key)
+                if ar_count == 1:
+                    await redis_client.expire(ar_key, 3600)
+                if ar_count > _AUTO_RESOLVE_MAX_PER_HOUR:
+                    return JSONResponse(
+                        {"error": f"Auto-resolve limit reached (max {_AUTO_RESOLVE_MAX_PER_HOUR}/hour per team) — results will update automatically after next GW"},
                         status_code=429,
                     )
 
@@ -739,7 +770,7 @@ async def rate_limit_middleware(request, call_next):
 # --- Register all routers ---
 from api.routes import (
     squad, transfers, optimization, rivals, live, chips, players, intel, bandit,
-    market, review, decision_log, oracle, news, user, lab, jobs, fixtures,
+    market, review, decision_log, oracle, news, user, lab, jobs, fixtures, status, admin,
 )
 from api.websocket import router as ws_router
 
@@ -761,6 +792,8 @@ app.include_router(user.router,         prefix="/api/user",         tags=["User"
 app.include_router(lab.router,          prefix="/api/lab",          tags=["Lab"])
 app.include_router(jobs.router,         prefix="/api/jobs",         tags=["Jobs"])
 app.include_router(fixtures.router,     prefix="/api/fixtures",     tags=["Fixtures"])
+app.include_router(status.router,       prefix="/api/status",       tags=["Status"])
+app.include_router(admin.router,        prefix="/api/admin",        tags=["Admin"])
 app.include_router(ws_router,           tags=["WebSocket"])
 
 
@@ -795,12 +828,32 @@ async def get_current_gameweek():
     now = datetime.now(timezone.utc)
     deadline_aware = current_gw.deadline_time.replace(tzinfo=timezone.utc) if current_gw.deadline_time.tzinfo is None else current_gw.deadline_time
 
+    from datetime import timedelta
+
     if current_gw.finished:
-        state = "finished"
+        gw_end = current_gw.gw_end_time
+        settling_until = None
+        if gw_end:
+            if gw_end.tzinfo is None:
+                gw_end = gw_end.replace(tzinfo=timezone.utc)
+            settling_until = gw_end + timedelta(hours=12)
+
+        if settling_until and now < settling_until:
+            # Within 12h window after GW ended — hold recommendations
+            state = "settling"
+        else:
+            state = "finished"
     elif deadline_aware > now:
         state = "pre_deadline"
     else:
-        state = "deadline_passed"  # covers both "awaiting kickoff" and "in_progress" — FE can distinguish via fixtures
+        state = "deadline_passed"
+
+    gw_end_raw = current_gw.gw_end_time
+    settling_until_iso = None
+    if gw_end_raw and current_gw.finished:
+        if gw_end_raw.tzinfo is None:
+            gw_end_raw = gw_end_raw.replace(tzinfo=timezone.utc)
+        settling_until_iso = (gw_end_raw + timedelta(hours=12)).isoformat()
 
     return {
         "state": state,
@@ -808,6 +861,7 @@ async def get_current_gameweek():
         "next_gw": next_gw_obj.id if next_gw_obj else current_gw.id + 1,
         "deadline_time": current_gw.deadline_time.isoformat(),
         "finished": current_gw.finished,
+        "settling_until": settling_until_iso,
     }
 
 

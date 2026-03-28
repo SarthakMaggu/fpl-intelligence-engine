@@ -29,6 +29,15 @@ export interface BenchStrategy {
   reasoning: string;
 }
 
+export interface GWState {
+  state: "pre_deadline" | "deadline_passed" | "finished" | "settling" | "unknown";
+  current_gw: number | null;
+  next_gw: number | null;
+  finished: boolean;
+  deadline_time?: string | null;
+  settling_until?: string | null;
+}
+
 interface DataState {
   squad: Squad | null;
   players: Player[];
@@ -47,6 +56,11 @@ interface DataState {
   teamId: number | null;
   anonymousSessionToken: string | null;
   deadline: string | null;
+  // Global GW state — fetched once, shared across all pages (prevents per-page re-fetch flash)
+  gwState: GWState | null;
+  gwStateLoaded: boolean;
+  // Set to true if the transfers endpoint returned 429 (rate limited)
+  transfersRateLimited: boolean;
 }
 
 interface UIState {
@@ -83,6 +97,7 @@ interface Actions {
   fetchFixtureSwings: () => Promise<void>;
   fetchLeagues: () => Promise<void>;
   updateLiveScore: (data: LiveSquad) => void;
+  fetchGwState: () => Promise<void>;
 }
 
 type FPLStore = DataState & UIState & Actions;
@@ -113,6 +128,9 @@ export const useFPLStore = create<FPLStore>((set, get) => ({
   teamId: null,
   anonymousSessionToken: null,
   deadline: null,
+  gwState: null,
+  gwStateLoaded: false,
+  transfersRateLimited: false,
 
   selectedPlayerId: null,
   activeView: "pitch",
@@ -159,6 +177,8 @@ export const useFPLStore = create<FPLStore>((set, get) => ({
       captainCandidates: [],
       liveSquad: null,
       selectedPlayerId: null,
+      gwState: null,
+      gwStateLoaded: false,
     });
     // Redirect to landing — show Onboarding on home page
     if (typeof window !== "undefined") window.location.href = "/";
@@ -201,7 +221,8 @@ export const useFPLStore = create<FPLStore>((set, get) => ({
         await new Promise((r) => setTimeout(r, 1500));
       }
 
-      set({ syncPhase: "Refreshing data..." });
+      set({ syncPhase: "Refreshing data...", gwState: null, gwStateLoaded: false });
+      await get().fetchGwState();   // re-fetch GW state first so all pages see fresh state
       await get().fetchSquad();
       await Promise.all([get().fetchGwIntel(), get().fetchPriorityActions(), get().fetchTransfers(), get().fetchBenchStrategies(), get().fetchLeagues()]);
 
@@ -367,7 +388,12 @@ export const useFPLStore = create<FPLStore>((set, get) => ({
     try {
       const params = buildAuthQuery(teamId, anonymousSessionToken);
       const res = await fetch(`${API}/api/transfers/suggestions${params}`);
+      if (res.status === 429) {
+        set({ transfersRateLimited: true });
+        return;
+      }
       if (!res.ok) return;
+      set({ transfersRateLimited: false });
       const data = await res.json();
       // Normalize nested API format → flat TransferSuggestion interface
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -502,4 +528,16 @@ export const useFPLStore = create<FPLStore>((set, get) => ({
   },
 
   updateLiveScore: (data) => set({ liveSquad: data }),
+
+  // Fetch GW state once and cache globally — all pages share this to prevent
+  // per-page re-fetch and the resulting "content flash → underway" transition.
+  fetchGwState: async () => {
+    if (get().gwStateLoaded) return; // already fetched, use cached value
+    try {
+      const res = await fetch(`${API}/api/gameweeks/current`);
+      if (!res.ok) { set({ gwStateLoaded: true }); return; }
+      const data = await res.json();
+      set({ gwState: data || null, gwStateLoaded: true });
+    } catch { set({ gwStateLoaded: true }); }
+  },
 }));

@@ -1,7 +1,7 @@
 "use client";
-import { useEffect, useState } from "react";
+import { useEffect } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import { RefreshCw, LogOut } from "lucide-react";
+import { LogOut } from "lucide-react";
 import { useFPLStore } from "@/store/fpl.store";
 import NapkinPitch from "@/components/napkin/NapkinPitch";
 import TransferScratchpad from "@/components/cards/TransferScratchpad";
@@ -10,13 +10,6 @@ import ActionBrief from "@/components/cards/ActionBrief";
 import BottomDock from "@/components/BottomDock";
 import Onboarding from "@/components/Onboarding";
 import DeadlineTimer from "@/components/DeadlineTimer";
-
-interface GWState {
-  state: "pre_deadline" | "deadline_passed" | "finished" | "unknown";
-  current_gw: number | null;
-  next_gw: number | null;
-  finished: boolean;
-}
 
 const API = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
@@ -35,6 +28,7 @@ export default function HomePage() {
     onboardingComplete,
     isSyncing,
     syncPhase,
+    transfersRateLimited,
     fetchSquad,
     fetchGwIntel,
     fetchPriorityActions,
@@ -44,9 +38,9 @@ export default function HomePage() {
     setOnboardingComplete,
     logout,
     deadline,
+    gwState,
+    fetchGwState,
   } = useFPLStore();
-
-  const [gwState, setGwState] = useState<GWState | null>(null);
 
 
   useEffect(() => {
@@ -72,14 +66,52 @@ export default function HomePage() {
     fetchGwIntel();
     fetchPriorityActions();
     fetchTransfers();
-    fetch(`${API}/api/gameweeks/current`)
-      .then((r) => r.ok ? r.json() : null)
-      .then((d) => d && setGwState(d))
-      .catch(() => {});
+    fetchGwState(); // shared global — no re-fetch on return to this page
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [onboardingComplete, teamId, anonymousSessionToken]);
 
+  // Auto-sync: if the team loaded but has no squad or intel data,
+  // trigger a silent background sync once. This handles new users and
+  // team switches where the squad hasn't been fetched from FPL yet.
+  useEffect(() => {
+    if (!onboardingComplete || !teamId || isSyncing) return;
+    // Only auto-sync once per team session: wait for fetchSquad to settle (1s)
+    const t = setTimeout(() => {
+      if (!squad && !gwIntel && !isSyncing) {
+        syncSquad();
+      }
+    }, 1500);
+    return () => clearTimeout(t);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [onboardingComplete, teamId]);
+
   if (!onboardingComplete || (!teamId && !anonymousSessionToken)) return <Onboarding />;
+
+  // ── Full-screen sync loading bar ───────────────────────────────────────────
+  // Show whenever a sync is running OR on first load (no squad/intel yet).
+  // Never shows the "sync squad" empty-state prompt — user has no manual sync option.
+  const needsInitialLoad = onboardingComplete && teamId && !squad && !gwIntel && !isSyncing;
+  if (isSyncing || needsInitialLoad) {
+    return (
+      <div style={{
+        minHeight: "100vh", display: "flex", flexDirection: "column",
+        alignItems: "center", justifyContent: "center",
+        background: "var(--bg)", gap: 18,
+      }}>
+        {/* Indeterminate progress bar */}
+        <div style={{ width: 260, height: 2, background: "rgba(255,255,255,0.07)", borderRadius: 2, overflow: "hidden", position: "relative" }}>
+          <motion.div
+            animate={{ x: ["-100%", "160%"] }}
+            transition={{ repeat: Infinity, duration: 1.5, ease: "easeInOut" }}
+            style={{ position: "absolute", width: "60%", height: "100%", background: "var(--green)", borderRadius: 2, opacity: 0.85 }}
+          />
+        </div>
+        <span style={{ fontFamily: "var(--font-ui)", fontSize: 11, color: "var(--text-3)", letterSpacing: "0.04em" }}>
+          {syncPhase || "Loading squad…"}
+        </span>
+      </div>
+    );
+  }
 
   const ftCount = freeTransfers ?? squad?.free_transfers ?? 1;
   const bankM   = bankMillions ?? (squad ? squad.bank / 10 : 0);
@@ -145,37 +177,6 @@ export default function HomePage() {
         <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
           {deadline && <DeadlineTimer deadline={deadline} />}
 
-        <motion.button
-          whileHover={{ translateY: -1 }}
-          whileTap={{ scale: 0.97 }}
-          onClick={syncSquad}
-          disabled={isSyncing}
-          style={{
-            display: "flex",
-            alignItems: "center",
-            gap: 6,
-            fontFamily: "var(--font-ui)",
-            fontSize: 11,
-            fontWeight: 600,
-            padding: "6px 14px",
-            borderRadius: 8,
-            border: isSyncing ? "1px solid var(--divider)" : "1px solid rgba(34,197,94,0.3)",
-            background: isSyncing ? "rgba(255,255,255,0.02)" : "rgba(34,197,94,0.07)",
-            color: isSyncing ? "var(--text-3)" : "var(--green)",
-            cursor: isSyncing ? "not-allowed" : "pointer",
-            transition: "all 180ms",
-          }}
-        >
-          <motion.span
-            animate={isSyncing ? { rotate: 360 } : { rotate: 0 }}
-            transition={isSyncing ? { duration: 1, repeat: Infinity, ease: "linear" } : {}}
-            style={{ display: "flex" }}
-          >
-            <RefreshCw size={11} />
-          </motion.span>
-          {isSyncing ? (syncPhase || "syncing…") : "sync"}
-        </motion.button>
-
         {/* Logout / switch team */}
         <motion.button
           whileHover={{ translateY: -1 }}
@@ -216,8 +217,84 @@ export default function HomePage() {
           padding: "20px 20px 88px",
         }}
       >
-        {/* ── Deadline passed / live: show locked squad + status ──── */}
-        {gwState?.state === "deadline_passed" ? (
+        {/* ── Injury / doubtful banner — only shown when NOT live (squad is frozen during live GW) */}
+        {gwIntel && (gwIntel as any).injury_alerts && (gwIntel as any).injury_alerts.length > 0
+          && !(gwState?.state === "deadline_passed" && !gwState?.finished) && (
+          <motion.div
+            initial={{ opacity: 0, y: -4 }}
+            animate={{ opacity: 1, y: 0 }}
+            style={{
+              padding: "10px 14px",
+              marginBottom: 12,
+              background: "rgba(239,68,68,0.07)",
+              border: "1px solid rgba(239,68,68,0.25)",
+              borderRadius: 10,
+              display: "flex",
+              alignItems: "flex-start",
+              gap: 10,
+            }}
+          >
+            <span style={{ fontSize: 14, flexShrink: 0, marginTop: 1 }}>⚠️</span>
+            <div style={{ flex: 1 }}>
+              <div style={{ fontFamily: "var(--font-ui)", fontSize: 11, fontWeight: 700, color: "rgba(239,68,68,0.9)", letterSpacing: "0.06em", textTransform: "uppercase", marginBottom: 4 }}>
+                Squad alert
+              </div>
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+                {(gwIntel as any).injury_alerts.map((a: any) => (
+                  <span key={a.player_id} style={{
+                    fontFamily: "var(--font-ui)", fontSize: 11, color: "var(--text-1)",
+                    background: "rgba(239,68,68,0.08)", border: "1px solid rgba(239,68,68,0.2)",
+                    borderRadius: 6, padding: "2px 8px",
+                  }}>
+                    {a.web_name}
+                    {a.status === "d" && " · doubtful"}
+                    {a.status === "i" && " · injured"}
+                    {a.status === "s" && " · suspended"}
+                    {a.chance_of_playing != null && a.chance_of_playing < 75 && ` · ${a.chance_of_playing}%`}
+                    {a.news ? ` — ${a.news}` : ""}
+                  </span>
+                ))}
+              </div>
+            </div>
+          </motion.div>
+        )}
+
+        {/* ── Settling: GW ended, within 12h recommendation sync window ── */}
+        {gwState?.state === "settling" ? (
+          <motion.div
+            initial={{ opacity: 0, y: 8 }}
+            animate={{ opacity: 1, y: 0 }}
+            style={{
+              padding: "28px 24px", borderRadius: 16, textAlign: "center",
+              background: "var(--surface)", border: "1px solid var(--divider)",
+              maxWidth: 520, margin: "0 auto",
+            }}
+          >
+            <div style={{
+              width: 8, height: 8, borderRadius: "50%",
+              background: "var(--amber)", boxShadow: "0 0 10px var(--amber)",
+              margin: "0 auto 16px", animation: "captain-pulse 2s ease-in-out infinite",
+            }} />
+            <div style={{ fontFamily: "var(--font-ui)", fontSize: 13, fontWeight: 700, color: "var(--text-1)", marginBottom: 8 }}>
+              GW{gwState.current_gw} complete
+            </div>
+            <div style={{ fontFamily: "var(--font-ui)", fontSize: 12, color: "var(--text-3)", lineHeight: 1.6 }}>
+              GW{gwState.next_gw ?? (gwState.current_gw! + 1)} recommendations sync in{" "}
+              {gwState.settling_until
+                ? (() => {
+                    const diff = (new Date(gwState.settling_until).getTime() - Date.now()) / 60000;
+                    const h = Math.floor(diff / 60);
+                    const m = Math.round(diff % 60);
+                    return h > 0 ? `~${h}h ${m}m` : `~${m}m`;
+                  })()
+                : "~12h"}
+              {" "}— data settling overnight.
+            </div>
+            <div style={{ fontFamily: "var(--font-ui)", fontSize: 11, color: "var(--text-3)", marginTop: 12, opacity: 0.6 }}>
+              Check the Status page for exact timing.
+            </div>
+          </motion.div>
+        ) : gwState?.state === "deadline_passed" ? (
           <>
             {/* Thin status bar */}
             <motion.div
@@ -249,10 +326,30 @@ export default function HomePage() {
               )}
             </motion.div>
 
+            {/* Post-deadline first-login notice — no priority actions means just joined */}
+            {(!priorityActions || priorityActions.actions.length === 0) && (
+              <motion.div
+                initial={{ opacity: 0, y: -4 }}
+                animate={{ opacity: 1, y: 0 }}
+                style={{
+                  padding: "10px 14px", marginBottom: 12,
+                  background: "rgba(59,130,246,0.07)", border: "1px solid rgba(59,130,246,0.22)",
+                  borderRadius: 10, maxWidth: 700, margin: "0 auto 12px",
+                }}
+              >
+                <div style={{ fontFamily: "var(--font-ui)", fontSize: 11, color: "rgba(59,130,246,0.9)", fontWeight: 600, letterSpacing: "0.05em", textTransform: "uppercase", marginBottom: 3 }}>
+                  GW{gwState.current_gw} locked
+                </div>
+                <div style={{ fontFamily: "var(--font-ui)", fontSize: 11, color: "var(--text-2)", lineHeight: 1.5 }}>
+                  Deadline has passed — squad is locked for this gameweek. Recommendations and decision tracking begin from GW{gwState.next_gw ?? (gwState.current_gw! + 1)}.
+                </div>
+              </motion.div>
+            )}
+
             {/* Pitch — squad is locked, centered + large markers */}
             <div style={{ maxWidth: 700, margin: "0 auto", width: "100%" }}>
               {squad
-                ? <NapkinPitch picks={squad.squad} large />
+                ? <NapkinPitch picks={squad.squad} large isLiveGw={!gwState.finished} />
                 : <EmptyPitch />}
             </div>
           </>
@@ -270,7 +367,7 @@ export default function HomePage() {
                 )}
                 {gwIntel
                   ? <StatsPostIt intel={gwIntel} />
-                  : !priorityActions && <EmptyGlass label="sync squad to load intel" />}
+                  : !priorityActions && <EmptyGlass  />}
               </div>
 
               {/* Center — Pitch */}
@@ -288,6 +385,7 @@ export default function HomePage() {
                   bankMillions={bankM}
                   optimalSquad={optimalSquad}
                   benchStrategies={benchStrategies}
+                  rateLimited={transfersRateLimited}
                 />
               </div>
             </div>
@@ -300,7 +398,7 @@ export default function HomePage() {
               )}
               {gwIntel
                 ? <StatsPostIt intel={gwIntel} />
-                : !priorityActions && <EmptyGlass label="sync squad to load intel" />}
+                : !priorityActions && <EmptyGlass  />}
               <TransferScratchpad
                 suggestions={transferSuggestions}
                 freeTransfers={ftCount}
@@ -331,32 +429,35 @@ function EmptyPitch() {
         flexDirection: "column",
         alignItems: "center",
         justifyContent: "center",
-        gap: 10,
+        gap: 14,
       }}
     >
-      <div
-        style={{
-          width: 52,
-          height: 52,
-          borderRadius: "50%",
-          background: "rgba(34,197,94,0.06)",
-          border: "1px solid rgba(34,197,94,0.18)",
-          display: "flex",
-          alignItems: "center",
-          justifyContent: "center",
-          fontSize: 22,
-        }}
-      >
-        ⚽
+      {/* Pulsing pitch outline skeleton */}
+      <div style={{ position: "relative", width: 52, height: 52 }}>
+        <motion.div
+          animate={{ opacity: [0.3, 0.7, 0.3] }}
+          transition={{ repeat: Infinity, duration: 1.8, ease: "easeInOut" }}
+          style={{
+            width: 52, height: 52, borderRadius: "50%",
+            background: "rgba(34,197,94,0.06)", border: "1px solid rgba(34,197,94,0.22)",
+            display: "flex", alignItems: "center", justifyContent: "center", fontSize: 22,
+          }}
+        >
+          ⚽
+        </motion.div>
       </div>
-      <p style={{ fontSize: 12, color: "var(--text-3)", fontFamily: "var(--font-ui)" }}>
-        sync squad to load pitch
-      </p>
+      <div style={{ width: 120, height: 2, background: "rgba(255,255,255,0.07)", borderRadius: 2, overflow: "hidden" }}>
+        <motion.div
+          animate={{ x: ["-100%", "160%"] }}
+          transition={{ repeat: Infinity, duration: 1.5, ease: "easeInOut" }}
+          style={{ width: "60%", height: "100%", background: "rgba(34,197,94,0.4)", borderRadius: 2 }}
+        />
+      </div>
     </motion.div>
   );
 }
 
-function EmptyGlass({ label }: { label: string }) {
+function EmptyGlass() {
   return (
     <motion.div
       initial={{ opacity: 0 }}
@@ -364,7 +465,13 @@ function EmptyGlass({ label }: { label: string }) {
       className="glass"
       style={{ borderRadius: 16, padding: "32px 20px", textAlign: "center" }}
     >
-      <p style={{ fontSize: 12, color: "var(--text-3)", fontFamily: "var(--font-ui)" }}>{label}</p>
+      <div style={{ width: 80, height: 2, background: "rgba(255,255,255,0.07)", borderRadius: 2, overflow: "hidden", margin: "0 auto" }}>
+        <motion.div
+          animate={{ x: ["-100%", "160%"] }}
+          transition={{ repeat: Infinity, duration: 1.5, ease: "easeInOut" }}
+          style={{ width: "60%", height: "100%", background: "rgba(255,255,255,0.15)", borderRadius: 2 }}
+        />
+      </div>
     </motion.div>
   );
 }

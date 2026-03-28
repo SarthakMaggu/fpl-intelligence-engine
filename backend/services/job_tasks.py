@@ -30,28 +30,49 @@ async def run_backtest_job(payload: dict) -> dict:
     )
 
     model_version = payload.get("model_version", "current")
-    seasons = payload.get("seasons", ["2024-25"])
+    # Default: backtest all 3 seasons so the lab page shows honest cross-season MAE
+    seasons = payload.get("seasons", ["2022-23", "2023-24", "2024-25"])
     strategies = payload.get("strategies", [])
     result_payload: dict = {"model_metrics": 0, "strategy_metrics": {}}
 
     async with AsyncSessionLocal() as db:
+        # ── Delete seeded/stale synthetic entries before re-computing ──────────
+        # The DB may contain synthetic rows inserted by _seed_synthetic_backtest_data
+        # or computed with wrong features (player_features_history). We replace all
+        # of them with honest results from historical_gw_stats.
+        from sqlalchemy import delete as sa_delete
+        from models.db.backtest import BacktestModelMetrics
+        for season in seasons:
+            await db.execute(
+                sa_delete(BacktestModelMetrics).where(
+                    BacktestModelMetrics.season == season,
+                    BacktestModelMetrics.model_version.in_(["synthetic", "current"]),
+                )
+            )
+        await db.commit()
+
+        # Also purge legacy 'historical' entries (produced by the old
+        # run_model_backtest_for_season which used player_features_history with
+        # wrong column names → all zeros → inflated MAE). Replace with honest
+        # 'current' entries from run_model_backtest below.
+        for season in seasons:
+            await db.execute(
+                sa_delete(BacktestModelMetrics).where(
+                    BacktestModelMetrics.season == season,
+                    BacktestModelMetrics.model_version == "historical",
+                )
+            )
+        await db.commit()
+
         total_model_metrics = 0
         for season in seasons:
-            if season == "2024-25":
-                # Current season — actuals come from player_gw_history
-                rows = await run_model_backtest(
-                    model_version=model_version,
-                    seasons=[season],
-                    db=db,
-                    season=season,
-                )
-            else:
-                # Historical — actuals come from historical_gw_stats
-                rows = await run_model_backtest_for_season(
-                    season=season,
-                    db=db,
-                    model_version=model_version,
-                )
+            # All seasons now use historical_gw_stats (the correct approach)
+            rows = await run_model_backtest(
+                model_version=model_version,
+                seasons=[season],
+                db=db,
+                season=season,
+            )
             total_model_metrics += len(rows)
 
         result_payload["model_metrics"] = total_model_metrics

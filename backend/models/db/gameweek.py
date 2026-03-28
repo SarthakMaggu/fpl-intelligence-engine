@@ -20,6 +20,12 @@ class Gameweek(Base):
     is_next: Mapped[bool] = mapped_column(Boolean, default=False)
     is_previous: Mapped[bool] = mapped_column(Boolean, default=False)
 
+    # GW timing — derived from fixture kickoff_times after upsert_fixtures runs
+    # gw_start_time = first fixture kick-off (used for GW-live detection and 1hr-before sync)
+    # gw_end_time   = last fixture kick-off + 115min (approx full-time of last game)
+    gw_start_time: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    gw_end_time: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+
     # Computed: blank/double GW detection
     is_blank: Mapped[bool] = mapped_column(Boolean, default=False)   # some teams have no fixture
     is_double: Mapped[bool] = mapped_column(Boolean, default=False)  # some teams have 2 fixtures

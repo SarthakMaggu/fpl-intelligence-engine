@@ -193,7 +193,22 @@ async def ingest_vaastav_season(
 
 
 async def _upsert_batch(batch: List[Dict], db: AsyncSession) -> None:
-    """Bulk upsert a batch of HistoricalGWStats rows."""
+    """Bulk upsert a batch of HistoricalGWStats rows.
+
+    PostgreSQL ON CONFLICT DO UPDATE fails with CardinalityViolationError if the
+    same conflict key appears more than once in a single batch (the CSV can have
+    duplicate rows for the same player+gw due to DGW replays or data issues).
+    Deduplicate on (season, player_id, gw) before inserting — last row wins.
+    """
+    # Deduplicate: keep last occurrence of each (season, player_id, gw)
+    deduped: dict[tuple, dict] = {}
+    for item in batch:
+        key = (item.get("season"), item.get("player_id"), item.get("gw"))
+        deduped[key] = item
+    batch = list(deduped.values())
+    if not batch:
+        return
+
     stmt = (
         pg_insert(HistoricalGWStats)
         .values(batch)

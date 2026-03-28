@@ -210,7 +210,8 @@ function PlayerCard({ player, index }: { player: Player; index: number }) {
       </div>
 
       <div style={{ marginTop: 8, display: "flex", gap: 4, flexWrap: "wrap" }}>
-        {player.fdr_next != null && <span className="badge badge-muted" style={{ fontSize: 9 }}>FDR {player.fdr_next}</span>}
+        {player.fdr_next != null && player.fdr_next > 0 && <span className="badge badge-muted" style={{ fontSize: 9 }}>FDR {player.fdr_next}</span>}
+        {player.fdr_next === 0 && <span className="badge badge-muted" style={{ fontSize: 9 }}>BGW</span>}
         {player.suspension_risk && <span className="badge badge-amber" style={{ fontSize: 9 }}>YC</span>}
         {injured && <span className="badge badge-neg" style={{ fontSize: 9 }}>{player.status === "i" ? "inj" : "doubt"}</span>}
       </div>

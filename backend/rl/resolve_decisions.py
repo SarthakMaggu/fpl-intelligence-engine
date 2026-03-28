@@ -94,9 +94,15 @@ async def resolve_gw_decisions(
     for decision in decisions:
         was_followed = decision.decision_followed or False
         predicted_gain = decision.engine_predicted_gain or 0.0
+        # Normalise decision_type to lowercase for matching
+        dt = (decision.decision_type or "").lower()
 
-        if decision.decision_type == "captain":
-            actual_pts = player_pts_map.get(captain_player_id or -1, 0.0) * 2  # captain 2×
+        if dt in ("captain", "captain_pick", "captain_strategy"):
+            # Use actual_gain if cross-check already filled it (player's pts × 2 bonus)
+            if decision.actual_gain is not None:
+                actual_pts = float(decision.actual_gain) * 2  # restore 2× captain value
+            else:
+                actual_pts = player_pts_map.get(captain_player_id or -1, 0.0) * 2
             decision.actual_points = actual_pts
             decision.reward = compute_captain_reward(
                 predicted_xpts=decision.expected_points,
@@ -104,26 +110,27 @@ async def resolve_gw_decisions(
                 was_followed=was_followed,
             )
 
-        elif decision.decision_type == "transfer":
+        elif dt in ("transfer", "transfer_strategy"):
             decision.actual_points = actual_total_pts
+            # Use actual_gain (player_in pts - player_out pts) if set by cross-check
+            gain = float(decision.actual_gain) if decision.actual_gain is not None else (actual_total_pts - avg_gw_pts)
             decision.reward = compute_transfer_reward(
                 predicted_gain=predicted_gain,
-                actual_gain=actual_total_pts - avg_gw_pts,
-                # Use the stored hit_taken flag — no longer hardcoded False
+                actual_gain=gain,
                 hit_taken=bool(getattr(decision, "hit_taken", False)),
                 was_followed=was_followed,
             )
 
-        elif decision.decision_type == "chip":
+        elif dt in ("chip", "chip_used", "chip_recommendation"):
             decision.actual_points = actual_total_pts
             decision.reward = compute_chip_reward(
-                chip_used=chip_played,
+                chip_used=chip_played or decision.recommended_option,
                 chip_pts=actual_total_pts,
                 avg_gw_pts=avg_gw_pts,
                 was_followed=was_followed,
             )
 
-        elif decision.decision_type == "hit":
+        elif dt in ("hit",):
             decision.actual_points = actual_total_pts
             decision.reward = compute_hit_reward(
                 pts_gained=actual_total_pts - avg_gw_pts + 4.0,  # vs no-hit baseline

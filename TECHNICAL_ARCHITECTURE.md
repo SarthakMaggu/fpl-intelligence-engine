@@ -192,6 +192,7 @@ All routes are prefixed with `/api/`. Auth: `?team_id=N` for registered users, `
 | `GET` | `/api/health` | Health check: DB + Redis status |
 | `GET` | `/api/metrics` | Prometheus metrics endpoint |
 | `POST` | `/api/refresh` | Admin: manual trigger of full data pipeline |
+| `GET` | `/api/status` | System state: GW phase, model health, upcoming events (public) |
 
 ---
 
@@ -203,7 +204,7 @@ All tables created via SQLAlchemy `create_all` + `ALTER TABLE IF NOT EXISTS` at 
 |-------|------|---------|
 | `players` | `models/db/player.py` | FPL player master + current form/stats |
 | `teams` | `models/db/team.py` | Premier League teams |
-| `gameweeks` | `models/db/gameweek.py` | GW metadata: deadline, finished, highest/avg score |
+| `gameweeks` | `models/db/gameweek.py` | GW metadata: deadline, finished, highest/avg score, `gw_start_time` (MIN fixture kickoff), `gw_end_time` (MAX kickoff + 115min) |
 | `user_squad` | `models/db/user_squad.py` | Current squad picks per team_id |
 | `user_gw_history` | `models/db/history.py` | Post-GW settled points, rank, bench pts per team |
 | `player_gw_history` | `models/db/history.py` | Post-GW points per player |
@@ -231,16 +232,62 @@ All tables created via SQLAlchemy `create_all` + `ALTER TABLE IF NOT EXISTS` at 
 ### 4.1 Expected Points Model (xPts)
 
 **Algorithm:** LightGBM regression (GBDT)
-**Features (30):** form, points_per_game, xg_per_90, xa_per_90, selected_by_percent, now_cost, element_type, fdr_next, fdr_3gw, is_home_next, minutes_percent_last5, clean_sheet_prob, bps_per_game, ict_index, threat, creativity, influence, team_strength_attack, team_strength_defense, opponent_attack, opponent_defense, price_band (0–6), player_availability_score, news_sentiment, news_article_count, days_since_last_match, historical_avg_pts_position, form_trend_slope, transfer_delta, double_gw_flag
+
+**Features (29 defined, 27 used in training):**
+
+| Feature | Source | Notes |
+|---------|--------|-------|
+| `xg_per_90` | vaastav expected_goals / rolling-5GW minutes | Lagged shift(1) — no leakage |
+| `xa_per_90` | vaastav expected_assists / rolling-5GW minutes | Lagged shift(1) |
+| `npxg_per_90` | same as xg_per_90 (vaastav has no separate npxG) | |
+| `ict_index` | vaastav ict_index rolling-5GW mean | |
+| `bps_per_90` | vaastav bps / rolling-5GW minutes | |
+| `form` | rolling-5GW mean total_points | Shift(1) |
+| `points_per_game` | expanding mean total_points to prior GW | Shift(1) |
+| `pts_last_5_gws` | rolling-5GW sum total_points | Shift(1) |
+| `xg_last_5_gws` | rolling-5GW sum expected_goals | Shift(1) |
+| `xa_last_5_gws` | rolling-5GW sum expected_assists | Shift(1) |
+| `goals_last_5_gws` | rolling-5GW sum goals_scored | Shift(1) |
+| `cs_last_5_gws` | rolling-5GW sum clean_sheets | Shift(1) |
+| `minutes_trend` | mins_last5 / (mins_prev5 + 1), clipped 0–3 | Rotation risk signal |
+| `predicted_start_prob` | lagged-1 minutes ≥ 45 | 1 = likely start |
+| `predicted_60min_prob` | lagged-1 minutes ≥ 60 | 1 = likely 60+ mins |
+| `fdr_next` | opponent rolling avg goals conceded → 1–5 scale | Easy=1, Hard=5 |
+| `is_home_next` | was_home flag for current GW | |
+| `blank_gw` | 0 in training (no DGW data per player in vaastav) | Set live from FPL |
+| `double_gw` | 0 in training | Set live from FPL |
+| `fdr_next3_avg` | **not in vaastav → excluded from trained model** | Falls back to `fdr_next` at inference |
+| `opponent_goals_conceded_per90` | per-opponent rolling avg gc (training); derived from fdr_next (inference) | |
+| `selected_by_percent` | `(raw_selected × 15 / per_gw_total × 100)` — normalised to 0–100% | Critical: raw count ÷ per-GW sum × 15 × 100 |
+| `transfers_in_event_delta` | transfers_in_event − transfers_out_event | Net transfer activity |
+| `is_gk` / `is_def` / `is_mid` / `is_fwd` | position dummies | One-hot from element_type |
+| `news_sentiment` | **not in vaastav → excluded from trained model** | Filled 0 (neutral) at inference |
+| `season_stage` | (round − 1) / 37, clipped 0–1 | GW1=0, GW38=1 |
+
+**`price_millions` intentionally excluded** — no causal relationship with scoring. Including it creates a spurious negative correlation (expensive players regress to mean), systematically underpredicting elite players. Ownership/performance are captured via `selected_by_percent` and `points_per_game`.
 
 **Training:**
-- Data: vaastav 3-season history + Understat per-90 stats
-- Calibration: Per (position, price_band) residual corrections — stored in Redis `ml:calibration_map` (8-day TTL)
+- Data: vaastav GitHub CSV, 3 seasons (2022-23, 2023-24, 2024-25), ~84k GW×player rows
+- All rolling features use `shift(1)` within player×season groups — **zero data leakage**
+- `selected_by_percent` normalised via: `raw_count × 15 / Σ(per-GW selected) × 100` (each of the ~9M managers picks 15 players, so per-GW sum ÷ 15 ≈ total managers)
+- Model trains on `available_features = [f for f in XPTS_FEATURES if f in df.columns]` → 27 features (excludes `fdr_next3_avg` and `news_sentiment` which are not in vaastav)
+- Latest retrain metrics: CV-RMSE ≈ 1.949, n_samples = 83,835
+- Top feature importances (LightGBM split count): `transfers_in_event_delta` (1515), `selected_by_percent` (1295), `points_per_game` (1228), `ict_index` (1173), `bps_per_90` (1004)
 - Retrain trigger: Daily MAE check (08:00). If `MAE > 2.5 AND days_since_retrain > 14` → auto-retrain
 - Scheduled retrain: Every 4th Sunday 03:00 — full 3-season download + LightGBM fit
 
 **Bayesian calibration:**
-After each GW resolves (Tue ~14:00), mean residuals per (position, price_band) are computed and stored. Applied on every subsequent prediction: `corrected_xpts = raw_xpts * calibration_factor`.
+After each GW resolves (Tue ~14:00), mean residuals per (position, price_band) are computed and stored in Redis `ml:calibration_map` (8-day TTL). Applied additively on every subsequent prediction:
+`corrected_xpts = raw_xpts + residual_correction` — clipped to ±1.5 pts to prevent overcorrection on small samples.
+
+**Inference pipeline (`processor.build_player_feature_dataframe`):**
+1. For all ~830 FPL players: pull `form`, `points_per_game`, `ict_index`, `selected_by_percent`, `transfers_in_event_delta` directly from FPL API
+2. For squad players (~59): add rolling-5GW stats from `player_gw_history` DB table
+3. Derive `opponent_goals_conceded_per90` from `fdr_next` (FDR1→2.0, FDR3→1.3, FDR5→0.6)
+4. Set `fdr_next3_avg` = `fdr_next` as fallback (three-GW lookahead not pre-computed at inference)
+5. Add position dummies, `is_home_next`, `blank_gw`, `double_gw`, `season_stage`
+6. Model uses `feature_name_` (stored at training) to reindex — missing features filled with 0
+7. Apply Bayesian calibration corrections from Redis
 
 ### 4.2 Minutes / Rotation Model (Markov States)
 
@@ -336,6 +383,11 @@ APScheduler runs embedded in the FastAPI process — `AsyncIOScheduler`, timezon
 | `weekly_backtest` | Tue 15:00 | GW-by-GW model + strategy evaluation (current season) | — |
 | `historical_retrain` | Every 4th Sun 03:00 | Download vaastav + Understat; retrain LightGBM 3 seasons | ✅ |
 | `deadline_email_gw_N` | 24h before deadline | Pre-deadline briefing to all subscribers | — |
+| `gw_state_watcher` | Every 5 min | Detect GW transitions: (1) GW just finished → schedule post-GW chain; (2) ≤65 min to first kick-off → pre-kick-off squad sync + cross-check (all registered users). Uses Redis locks to fire each event exactly once. | — |
+
+**Post-GW chain (staggered):** T+5m full pipeline → T+13m ML refresh → T+23m Oracle resolve+calibration → T+33m backtest → T+43m MAE check
+
+**Pre-kick-off sync:** Fetches `entry/{id}/transfers/` for each registered user, applies pending IN/OUT to last GW squad, upserts as planned squad. Decision cross-check runs at this point to log followed/ignored decisions for the Review page.
 
 **Failure mechanism:** All ✅ jobs call `_send_admin_alert_safe(subject, body)` on exception. Alert goes to `ADMIN_ALERT_EMAIL` via SendGrid. Failures are non-blocking.
 
@@ -420,9 +472,42 @@ New visitor
 | `priorityActions` | `PriorityActions \| null` | Ranked action list for this GW |
 | `transferSuggestions` | `TransferSuggestion[]` | Engine-recommended transfers |
 | `benchStrategies` | `BenchStrategy[]` | 3-way bench→transfer→XI swap moves |
-| `gwIntel` | `GwIntelligence \| null` | Injury alerts, DGW players, suspension risk |
+| `gwIntel` | `GwIntelligence \| null` | Injury alerts, DGW players, suspension risk, `free_transfers`, `zero_ft_advice` (bench swaps + chip suggestion when FT=0) |
+| `gwState` | `GWState \| null` | Current GW state. Fetched once and cached. Reset on `logout()`. |
+| `gwStateLoaded` | `boolean` | Guards against duplicate fetches across page navigations. |
 
 `logout()` clears all state + localStorage + redirects to `/`.
+
+All squad syncing is **fully automatic** — there is no manual sync button. The `gw_state_watcher` job handles all syncs at the right time.
+
+### GW State Machine (4 states)
+
+**Backend states** (from `/api/status`):
+
+| State | When | System behaviour |
+|-------|------|-----------------|
+| `planning` | GW complete (`data_checked=True`) to next kick-off | Recommendations active, transfers enabled |
+| `pre_kickoff` | ≤65 min to first kick-off | Pre-kick-off squad sync fires, squad locked |
+| `live` | `gw_start_time ≤ now ≤ gw_end_time` | 3-layer data freeze active, no new predictions |
+| `settling` | `finished=True AND data_checked=False` | Waiting for FPL to process results |
+
+**Frontend rendering:**
+
+```
+gwState.state === "pre_deadline"  (planning / pre_kickoff)
+  → Pitch: show predictions + FDR for upcoming GW
+  → Strategy: recommendations active
+  → Injury banner: shown if any squad player is d/i/s or <75% chance
+
+gwState.state === "deadline_passed" AND !gwState.finished  (live)
+  → Pitch: show locked squad with frozen predictions
+  → Strategy: "GW underway" — no recommendations
+  → isLiveGw=true passed to NapkinPitch
+
+gwState.state === "deadline_passed" AND gwState.finished  (settling / done)
+  → Pitch: show results, plan for next GW
+  → Review tab: cross-check computes actual_gain
+```
 
 ---
 
@@ -435,7 +520,7 @@ fpl-intelligence-engine/
 │   ├── api/routes/          # 18 route files (see §2)
 │   ├── core/                # config.py, database.py, redis_client.py, middleware
 │   ├── data_pipeline/       # scheduler.py, fetcher.py, historical_backfill.py
-│   ├── features/            # player_features.py (feature engineering, 30 features)
+│   ├── features/            # player_features.py (feature engineering, 27 trained features)
 │   ├── ml/                  # xpts_model.py, minutes_model.py, price_model.py, model_loader.py
 │   ├── models/db/           # 21 SQLAlchemy models (see §3)
 │   ├── notifications/       # email_service.py, whatsapp_service.py
@@ -472,7 +557,7 @@ fpl-intelligence-engine/
 |---------|--------|----------|
 | Multi-user (500 cap + waitlist) | ✅ | `user.py`, `user_profile.py`, `waitlist.py` |
 | Anonymous sessions (30-day TTL) | ✅ | `anonymous_session.py`, `anon_cleanup` job |
-| xPts prediction (LightGBM, 30 features) | ✅ | `xpts_model.py`, `player_features.py` |
+| xPts prediction (LightGBM, 27 trained / 29 defined features) | ✅ | `xpts_model.py`, `player_features.py`, `historical_fetcher.py` |
 | Minutes/rotation model (Markov) | ✅ | `minutes_model.py` |
 | Price direction model | ✅ | `price_model.py` |
 | ILP squad optimisation (Oracle) | ✅ | `squad_optimizer.py`, `oracle.py` |
@@ -500,7 +585,7 @@ fpl-intelligence-engine/
 
 ---
 
-## 15. Known Limitations
+## 15. Known Limitations & Design Decisions
 
 - **GW top-team squad data**: FPL public API doesn't expose picks for the #1 ranked manager. The platform scans standings pages to find the manager, then fetches their picks. If FPL returns 404 or empty picks (happens for recent GWs before data propagates), `top_team.squad` will be empty. The "Fetch Actual Points" button retries this.
 
@@ -511,3 +596,21 @@ fpl-intelligence-engine/
 - **WebSocket on Railway**: Railway supports persistent connections. If you see WebSocket drops, check Railway's connection timeout settings — set `RAILWAY_TCP_TIMEOUT_SECONDS=300` if needed.
 
 - **Single backend instance**: APScheduler runs in-process. With Railway's auto-scaling (if enabled), multiple instances would run duplicate cron jobs. Keep `instances=1` on the backend service or disable auto-scale until a distributed lock is added.
+
+- **predicted_xpts_next is a single field**: It holds the "next game" prediction. Pre-deadline this is the upcoming GW. During a live GW it is frozen at those pre-deadline values. There is no separate `predicted_xpts_live` column — the freeze prevents mid-GW corruption. If a player is injured/suspended mid-GW, the field keeps the pre-match value until the GW finishes.
+
+- **Transfer individual gain tracking**: `actual_gain` for transfers = `player_in.pts − player_out.pts` for the resolved GW. Player IDs are stored when the decision is logged (intel.py lines 515-516). For decisions logged before player ID tracking was added, the cross-check endpoint parses player names from `recommended_option` ("OUT: X / IN: Y") and looks them up in the players table. Gain is computed immediately after cross-check from `api/event/{gw}/live/`.
+
+- **Ignored decisions when chip changes squad**: If a user plays a Free Hit in GW N, recommendations made before the chip (based on GW N-1 squad) are superseded by the Free Hit squad. Those pre-chip recommendations are not automatically marked "ignored" — they were overwritten by updated recommendations reflecting the Free Hit squad. This is by design: the audit trail should not retroactively attribute "ignored" status to recommendations that became irrelevant due to a squad overhaul.
+
+- **gwState caching**: GW state is fetched once per session and cached in Zustand (`gwStateLoaded=true`). It re-fetches on `syncSquad()` and `logout()`. Manual page refresh also resets it. This is intentional (no auto-polling) — sync is the trigger for state refresh.
+
+- **Rolling stats for non-squad players**: `player_gw_history` only stores per-GW data for the user's ~59 squad players. Transfer target players (non-squad) will have 0 for `pts_last_5_gws`, `xg_last_5_gws`, etc. at inference. The model compensates via `form` and `points_per_game` from the FPL API (available for all ~830 players), but rolling sums are zero — this slightly underestimates the xPts of hot transfer targets.
+
+- **`fdr_next3_avg` at inference**: The three-GW lookahead FDR average is not pre-computed at inference time. It falls back to `fdr_next` (single GW). The model was trained without this feature (not in vaastav data), so it has zero weight in the trained model — this is a no-op in practice.
+
+- **`selected_by_percent` scale normalisation**: vaastav `selected` column is a raw manager count (e.g. 2,700,000 for 30% ownership in a 9M-manager season). The live FPL API returns the percentage directly (0–100). Training normalises via `raw × 15 / per_gw_total × 100`. This is mathematically equivalent to: `raw / (total_managers)` because each manager picks 15 players, so `Σ(selected per GW) = total_managers × 15`.
+
+- **MinutesModel training**: No scheduled job trains the MinutesModel. It always uses the cold-start Markov heuristic. The training code exists in `minutes_model.py` but requires a separate trigger. This is by design until sufficient rotation history is accumulated.
+
+- **Historical CSV cache policy**: Completed seasons (2022-23, 2023-24, etc.) are cached permanently on disk — vaastav data for finished seasons is immutable. The **current season** cache expires after **7 days** so new GWs are included at the next monthly retrain. Cache files live at `models/ml/historical_data/`.

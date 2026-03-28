@@ -12,6 +12,7 @@ import json
 from datetime import datetime
 from typing import Optional
 
+import httpx
 from fastapi import APIRouter, Depends, Query, HTTPException, BackgroundTasks
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -137,6 +138,25 @@ async def _compute_oracle(
 
     oracle_pool["predicted_xpts_next"] = oracle_pool["predicted_xpts_next"].clip(upper=14.0)
 
+    # Mark blank-GW players — fetch fixtures for this GW and zero out teams with no game
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as _client:
+            fixtures_resp = await _client.get(
+                f"https://fantasy.premierleague.com/api/fixtures/?event={gameweek_id}"
+            )
+        if fixtures_resp.status_code == 200:
+            gw_fixtures = fixtures_resp.json()
+            teams_with_game: set[int] = set()
+            for fx in gw_fixtures:
+                teams_with_game.add(fx["team_h"])
+                teams_with_game.add(fx["team_a"])
+            oracle_pool["has_blank_gw"] = ~oracle_pool["team_id"].isin(teams_with_game)
+            blank_count = oracle_pool["has_blank_gw"].sum()
+            if blank_count:
+                logger.info(f"Oracle GW{gameweek_id}: {blank_count} players marked blank-GW (no fixture)")
+    except Exception as _fx_exc:
+        logger.warning(f"Oracle GW{gameweek_id}: could not fetch fixtures for blank-GW check: {_fx_exc}")
+
     # Run ILP: £100m budget, unlimited free transfers → no hit cost
     ORACLE_BUDGET = 1000  # £100.0m in tenths of £1 (FPL pence)
     FREE_TRANSFERS = 15   # Effectively unlimited — no hit cost penalty
@@ -235,25 +255,33 @@ async def _compute_oracle(
 async def take_oracle_snapshot(
     team_context: dict = Depends(get_team_context),
     db: AsyncSession = Depends(get_db_session),
+    gw_id: Optional[int] = Query(None, description="Specific GW to snapshot (defaults to current GW)"),
 ):
     """
-    Compute and store the oracle best team for the current GW.
-    Takes 2-8 seconds (ILP solve). Called automatically at GW deadline,
-    or manually via this endpoint.
+    Compute and store the oracle best team.
+    Defaults to current GW. Pass gw_id to compute for a specific past GW.
+    Takes 2-8 seconds (ILP solve). Called automatically at GW deadline.
     """
     team_id = team_context["team_id"]
-    # Get current GW — if finished, use next GW for snapshot
-    gw_res = await db.execute(select(Gameweek).where(Gameweek.is_current == True))
-    current_gw = gw_res.scalar_one_or_none()
-    if not current_gw:
-        raise HTTPException(404, "No active gameweek")
 
-    target_gw = current_gw
-    if current_gw.finished:
-        next_res = await db.execute(select(Gameweek).where(Gameweek.is_next == True))
-        next_gw = next_res.scalar_one_or_none()
-        if next_gw:
-            target_gw = next_gw
+    if gw_id is not None:
+        # Specific GW requested (e.g. backfill)
+        gw_res = await db.execute(select(Gameweek).where(Gameweek.id == gw_id))
+        target_gw = gw_res.scalar_one_or_none()
+        if not target_gw:
+            raise HTTPException(404, f"Gameweek {gw_id} not found")
+    else:
+        # Default: current GW (if finished, use next)
+        gw_res = await db.execute(select(Gameweek).where(Gameweek.is_current == True))
+        current_gw = gw_res.scalar_one_or_none()
+        if not current_gw:
+            raise HTTPException(404, "No active gameweek")
+        target_gw = current_gw
+        if current_gw.finished:
+            next_res = await db.execute(select(Gameweek).where(Gameweek.is_next == True))
+            next_gw = next_res.scalar_one_or_none()
+            if next_gw:
+                target_gw = next_gw
 
     record = await _compute_oracle(team_id, target_gw.id, db)
 
@@ -275,6 +303,57 @@ async def take_oracle_snapshot(
     }
 
 
+@router.post("/backfill")
+async def backfill_oracle_snapshots(
+    team_context: dict = Depends(get_team_context),
+    db: AsyncSession = Depends(get_db_session),
+    from_gw: int = Query(..., description="First GW to backfill"),
+    to_gw: int = Query(..., description="Last GW to backfill (inclusive)"),
+):
+    """
+    Compute oracle snapshots for a range of past GWs (gap-filling).
+    Only processes GWs that don't already have a snapshot for this team.
+    Called automatically when review page detects a gap (e.g. GW30 exists, GW31 missing, now in GW32).
+    """
+    team_id = team_context["team_id"]
+
+    if from_gw > to_gw or to_gw - from_gw > 10:
+        raise HTTPException(400, "Invalid GW range (max 10 GWs per backfill)")
+
+    # Load existing snapshots for this team in the range
+    existing_res = await db.execute(
+        select(GWOracle.gameweek_id).where(
+            GWOracle.team_id == team_id,
+            GWOracle.gameweek_id >= from_gw,
+            GWOracle.gameweek_id <= to_gw,
+        )
+    )
+    existing_gws = {row[0] for row in existing_res.fetchall()}
+
+    # Load all GWs in range
+    gws_res = await db.execute(
+        select(Gameweek).where(
+            Gameweek.id >= from_gw,
+            Gameweek.id <= to_gw,
+        ).order_by(Gameweek.id)
+    )
+    gws = gws_res.scalars().all()
+
+    results = []
+    for gw in gws:
+        if gw.id in existing_gws:
+            results.append({"gw_id": gw.id, "status": "skipped", "reason": "already exists"})
+            continue
+        try:
+            record = await _compute_oracle(team_id, gw.id, db)
+            results.append({"gw_id": gw.id, "status": "ok", "oracle_xpts": record.oracle_xpts})
+        except Exception as e:
+            logger.warning(f"Backfill oracle GW{gw.id} team={team_id}: {e}")
+            results.append({"gw_id": gw.id, "status": "error", "reason": str(e)})
+
+    return {"team_id": team_id, "from_gw": from_gw, "to_gw": to_gw, "results": results}
+
+
 @router.get("/history")
 async def get_oracle_history(
     team_context: dict = Depends(get_team_context),
@@ -293,19 +372,46 @@ async def get_oracle_history(
         cached["analysis_mode"] = "cached"
         return cached
 
+    # Determine the current GW so we can exclude "next GW" unresolved snapshots.
+    # The Oracle history is for reviewing past performance — upcoming GW planning
+    # (resolved=False AND gameweek > current_gw) would confusingly appear as "GW in play".
+    from models.db.gameweek import Gameweek as _GW
+    _cur_gw_res = await db.execute(select(_GW).where(_GW.is_current == True))  # noqa: E712
+    _current_gw = _cur_gw_res.scalar_one_or_none()
+    _current_gw_id = _current_gw.id if _current_gw else 0
+
     res = await db.execute(
         select(GWOracle)
-        .where(GWOracle.team_id == team_id)
+        .where(
+            GWOracle.team_id == team_id,
+            # Exclude unresolved snapshots for future GWs (next-GW planning).
+            # Include: all resolved GWs + current GW (in-play or just-finished).
+            # Exclude: GW > current_gw with no resolved_at (upcoming, not yet played).
+            (GWOracle.gameweek_id <= _current_gw_id) | (GWOracle.resolved_at.isnot(None)),
+        )
         .order_by(GWOracle.gameweek_id.desc())
         .limit(limit)
     )
     records: list[GWOracle] = res.scalars().all()
 
     # Collect all player IDs across all snapshots so we can bulk-load team info
+    # Include oracle squad IDs, missed-player IDs, and top-team captain IDs
     all_squad_ids: set[int] = set()
     for r in records:
         ids = json.loads(r.oracle_squad_json or "[]")
         all_squad_ids.update(ids)
+        # missed_players_json may store IDs when name lookup failed at resolve time
+        for mp in json.loads(r.missed_players_json or "[]"):
+            try:
+                all_squad_ids.add(int(mp))
+            except (ValueError, TypeError):
+                pass  # already a name — no lookup needed
+        # top_team_captain may also be stored as a numeric ID string
+        if r.top_team_captain:
+            try:
+                all_squad_ids.add(int(r.top_team_captain))
+            except (ValueError, TypeError):
+                pass  # already a name
 
     from models.db.team import Team
     player_team_map: dict[int, dict] = {}
@@ -330,6 +436,7 @@ async def get_oracle_history(
     for gw in gw_res.scalars().all():
         gameweek_meta[gw.id] = {
             "highest_score": gw.highest_score,
+            "average_entry_score": gw.average_entry_score,
             "finished": gw.finished,
         }
     user_hist_res = await db.execute(
@@ -362,7 +469,16 @@ async def get_oracle_history(
                 "team_short_name": info.get("team_short_name"),
                 "element_type": info.get("element_type", 3),
             })
-        missed = json.loads(r.missed_players_json or "[]")
+        missed_raw = json.loads(r.missed_players_json or "[]")
+        # Resolve IDs → names for any entries that are numeric strings or ints
+        missed = []
+        for mp in missed_raw:
+            try:
+                pid = int(mp)
+                name = (player_team_map.get(pid) or {}).get("web_name") or str(pid)
+                missed.append(name)
+            except (ValueError, TypeError):
+                missed.append(str(mp))  # already a name
         blind_spots = json.loads(r.oracle_blind_spots_json or "{}")
         fallback_highest_score = (gameweek_meta.get(r.gameweek_id) or {}).get("highest_score")
         fallback_top_points = r.top_team_points if r.top_team_points is not None else fallback_highest_score
@@ -395,7 +511,12 @@ async def get_oracle_history(
                 "points_normalised": r.top_team_points_normalized,
                 "chip_adjustment": r.top_team_chip_adjustment,
                 "squad": json.loads(r.top_team_squad_json or "[]"),
-                "captain": r.top_team_captain,
+                "captain": (
+                    # Resolve numeric ID → name if stored as ID string
+                    (player_team_map.get(int(r.top_team_captain)) or {}).get("web_name", r.top_team_captain)
+                    if r.top_team_captain and r.top_team_captain.isdigit()
+                    else r.top_team_captain
+                ),
                 "chip": r.top_team_chip,
                 "chip_miss_reason": r.chip_miss_reason,
                 "status": fallback_status,
@@ -414,6 +535,13 @@ async def get_oracle_history(
             "oracle_beat_top": r.oracle_beat_top,
             "missed_players": missed,
             "blind_spots": blind_spots,
+            # GW context for honest performance framing
+            "gw_average": (gameweek_meta.get(r.gameweek_id) or {}).get("average_entry_score"),
+            "oracle_vs_avg": (
+                round(r.actual_oracle_points - (gameweek_meta.get(r.gameweek_id) or {}).get("average_entry_score", 0), 1)
+                if r.actual_oracle_points is not None and (gameweek_meta.get(r.gameweek_id) or {}).get("average_entry_score")
+                else None
+            ),
             "analysis_mode": "full",
             "session_expires_at": session.expires_at.isoformat() if session else None,
         }
@@ -440,8 +568,14 @@ async def auto_resolve_oracle(
     db: AsyncSession = Depends(get_db_session),
 ):
     """
-    Auto-resolve all unresolved oracle snapshots for finished GWs.
-    Fetches actual GW points from FPL live API for both oracle XI and user squad.
+    Auto-resolve oracle snapshots for finished GWs.
+
+    Two passes:
+    1. Full resolve (oracle pts + algo pts + top-team): for snapshots not yet resolved.
+    2. Top-team refresh only: for already-resolved snapshots — FPL finalises bonus
+       points after the initial "finished" flag, so the stored highest_score can be
+       stale. Re-fetching bootstrap-static on every "Fetch Actual Points" click
+       ensures the displayed value reflects final bonus-adjusted points.
     """
     import httpx
 
@@ -449,113 +583,172 @@ async def auto_resolve_oracle(
     gw_res = await db.execute(select(Gameweek).where(Gameweek.finished == True))
     finished_gw_ids = {gw.id for gw in gw_res.scalars().all()}
 
-    # 2. Get all unresolved snapshots for this team
+    # 2. Get ALL snapshots for this team that belong to a finished GW
     snap_res = await db.execute(
-        select(GWOracle).where(
-            and_(
-                GWOracle.team_id == team_id,
-                GWOracle.resolved_at.is_(None),
-            )
-        )
+        select(GWOracle).where(GWOracle.team_id == team_id)
     )
-    unresolved = [
-        s
-        for s in snap_res.scalars().all()
-        if s.gameweek_id in finished_gw_ids
-        and (
-            s.resolved_at is None
-            or s.actual_oracle_points is None
-            or s.actual_algo_points is None
-            or s.top_team_points is None
-            or not s.top_team_squad_json
-            or getattr(s, "top_team_status", None) in (None, "", "unavailable")
-        )
+    all_snapshots = [s for s in snap_res.scalars().all() if s.gameweek_id in finished_gw_ids]
+
+    # Split into: needs full resolve vs just top-team refresh
+    needs_full_resolve = [
+        s for s in all_snapshots
+        if s.resolved_at is None
+        or s.actual_oracle_points is None
+        or s.actual_algo_points is None
+    ]
+    needs_top_refresh = [
+        s for s in all_snapshots
+        if s not in needs_full_resolve  # already fully resolved
+        and (s.top_team_points is None or not s.top_team_squad_json
+             or getattr(s, "top_team_status", None) in (None, "", "unavailable"))
+    ]
+    # Also always refresh top-team for resolved snapshots (catches bonus-pt updates)
+    already_resolved = [
+        s for s in all_snapshots
+        if s not in needs_full_resolve and s not in needs_top_refresh
     ]
 
+    unresolved = needs_full_resolve + needs_top_refresh + already_resolved
+
     if not unresolved:
-        return {"resolved": 0, "message": "No unresolved snapshots for finished GWs", "details": []}
+        return {"resolved": 0, "message": "No snapshots found for finished GWs", "details": []}
 
     resolved_list = []
     async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+        # Fetch bootstrap-static once — used for all snapshots to get authoritative highest_score
+        bootstrap_events: list[dict] = []
+        try:
+            _bs = await _fetch_json(client, "https://fantasy.premierleague.com/api/bootstrap-static/")
+            bootstrap_events = _bs.get("events", [])
+        except Exception as _bs_exc:
+            logger.warning(f"auto-resolve: bootstrap-static fetch failed: {_bs_exc}")
+
         for snapshot in unresolved:
             gw_id = snapshot.gameweek_id
+            is_already_resolved = snapshot in already_resolved
+            needs_pts_compute = (
+                snapshot.resolved_at is None
+                or snapshot.actual_oracle_points is None
+                or snapshot.actual_algo_points is None
+            )
             try:
-                # Fetch FPL live data for this GW
+                # Always available — needed for learner & beat_top comparison
+                oracle_xi_ids: list[int] = json.loads(snapshot.oracle_xi_json or "[]")[:11]
+                oracle_captain_id = snapshot.oracle_captain_id
+
+                # ── For already-resolved snapshots: only refresh top_team_points ──
+                # The chip normalization and squad data are already correct from the
+                # initial resolve that had live data. Only the raw highest_score can
+                # be stale (FPL adds bonus points after finished=True).
+                if is_already_resolved:
+                    gw_event = next((e for e in bootstrap_events if e.get("id") == gw_id), None)
+                    if gw_event:
+                        new_top_pts = gw_event.get("highest_score") or 0
+                        if new_top_pts and new_top_pts != snapshot.top_team_points:
+                            old_pts = snapshot.top_team_points or 0
+                            snapshot.top_team_points = new_top_pts
+                            # Recompute normalized: the chip_adjustment (bench pts) is unchanged
+                            # since bench players' scores don't change after initial resolve.
+                            # The extra points (rescores) went to XI players, so adjustment stays.
+                            adjustment = snapshot.top_team_chip_adjustment or 0
+                            new_normalized = new_top_pts - adjustment
+                            snapshot.top_team_points_normalized = new_normalized
+                            # Re-evaluate whether oracle beat the normalized top team score
+                            if snapshot.actual_oracle_points is not None:
+                                snapshot.oracle_beat_top = snapshot.actual_oracle_points >= new_normalized
+                            logger.info(
+                                f"auto-resolve GW{gw_id}: top_team_points {old_pts}→{new_top_pts} "
+                                f"normalised→{new_normalized} oracle_beat_top={snapshot.oracle_beat_top}"
+                            )
+                    resolved_list.append({
+                        "gameweek_id": gw_id,
+                        "oracle_actual": snapshot.actual_oracle_points,
+                        "algo_actual": snapshot.actual_algo_points,
+                        "oracle_beat_algo": snapshot.oracle_beat_algo,
+                        "top_team_pts": snapshot.top_team_points,
+                        "top_team_pts_normalised": snapshot.top_team_points_normalized,
+                        "chip": snapshot.top_team_chip,
+                        "chip_adjustment": snapshot.top_team_chip_adjustment,
+                        "chip_miss_reason": snapshot.chip_miss_reason,
+                        "oracle_beat_top": snapshot.oracle_beat_top,
+                        "missed_players": json.loads(snapshot.missed_players_json or "[]"),
+                    })
+                    continue
+
+                live_map: dict[int, int] = {}
+                live_payload: dict = {}
+                # Always fetch live data — needed for pts computation AND chip normalization
                 try:
                     live_payload = await _fetch_json(
                         client,
                         f"https://fantasy.premierleague.com/api/event/{gw_id}/live/",
                     )
+                    live_map = {
+                        e["id"]: e["stats"]["total_points"]
+                        for e in live_payload.get("elements", [])
+                    }
                 except Exception as live_exc:
                     logger.warning(f"auto-resolve: FPL live/{gw_id} fetch failed: {live_exc}")
-                    continue
-                live_map: dict[int, int] = {
-                    e["id"]: e["stats"]["total_points"]
-                    for e in live_payload.get("elements", [])
-                }
+                    if needs_pts_compute:
+                        needs_pts_compute = False
 
-                # Compute oracle XI actual points (captain 2× unless 3xc, use raw for fair comparison)
-                oracle_xi_ids: list[int] = json.loads(snapshot.oracle_xi_json or "[]")[:11]
-                oracle_captain_id = snapshot.oracle_captain_id
-                oracle_actual = sum(live_map.get(pid, 0) for pid in oracle_xi_ids)
-                # Oracle captain always gets 2× (no TC chip for oracle benchmark)
-                if oracle_captain_id and oracle_captain_id in live_map:
-                    oracle_actual += live_map[oracle_captain_id]  # extra 1× for captain
+                if needs_pts_compute:
+                    # Compute oracle XI actual points (captain 2×)
+                    oracle_actual = sum(live_map.get(pid, 0) for pid in oracle_xi_ids)
+                    if oracle_captain_id and oracle_captain_id in live_map:
+                        oracle_actual += live_map[oracle_captain_id]  # extra 1× for captain
 
-                # Fetch user squad picks for this GW from FPL API (handles captain multiplier)
+                    # Fetch user squad picks for this GW from FPL API
+                    try:
+                        picks_data = await _fetch_json(
+                            client,
+                            f"https://fantasy.premierleague.com/api/entry/{team_id}/event/{gw_id}/picks/",
+                        )
+                        picks = picks_data.get("picks", [])
+                        active_chip = picks_data.get("active_chip") or ""
+                        algo_actual = 0
+                        for p in picks:
+                            if p.get("position", 12) > 11:
+                                continue  # bench player
+                            raw_pts = live_map.get(p["element"], 0)
+                            mult = p.get("multiplier", 1)
+                            if active_chip == "3xc" and p.get("is_captain"):
+                                mult = 3
+                            algo_actual += raw_pts * mult
+                    except Exception:
+                        algo_squad_ids: list[int] = json.loads(snapshot.algo_squad_json or "[]")
+                        algo_actual = sum(live_map.get(pid, 0) for pid in algo_squad_ids[:11])
+
+                    snapshot.actual_oracle_points = round(float(oracle_actual), 1)
+                    snapshot.actual_algo_points = round(float(algo_actual), 1)
+                    snapshot.oracle_beat_algo = oracle_actual > algo_actual
+                    snapshot.resolved_at = datetime.utcnow()
+                else:
+                    oracle_actual = snapshot.actual_oracle_points or 0
+
+                # ── Fetch true GW top scorer from bootstrap-static (authoritative) ──
+                # Uses the pre-fetched bootstrap_events (fetched once before loop).
                 try:
-                    picks_data = await _fetch_json(
-                        client,
-                        f"https://fantasy.premierleague.com/api/entry/{team_id}/event/{gw_id}/picks/",
-                    )
-                    picks = picks_data.get("picks", [])
-                    active_chip = picks_data.get("active_chip") or ""
-                    algo_actual = 0
-                    for p in picks:
-                        if p.get("position", 12) > 11:
-                            continue  # bench player
-                        raw_pts = live_map.get(p["element"], 0)
-                        mult = p.get("multiplier", 1)
-                        # TC chip gives 3× captain, regular captain 2×
-                        if active_chip == "3xc" and p.get("is_captain"):
-                            mult = 3
-                        algo_actual += raw_pts * mult
-                except Exception:
-                    # No historical picks available — use stored algo squad
-                    algo_squad_ids: list[int] = json.loads(snapshot.algo_squad_json or "[]")
-                    algo_actual = sum(live_map.get(pid, 0) for pid in algo_squad_ids[:11])
-
-                snapshot.actual_oracle_points = round(float(oracle_actual), 1)
-                snapshot.actual_algo_points = round(float(algo_actual), 1)
-                snapshot.oracle_beat_algo = oracle_actual > algo_actual
-                snapshot.resolved_at = datetime.utcnow()
-
-                # ── Fetch top FPL team for this GW and learn from it ──────────
-                try:
-                    # Multi-page standings scan — top 250 entries (5 pages × 50)
-                    # Finds the true GW top scorer, not just the top-50-overall top scorer
                     top_tid, top_name, top_pts = 0, "Unknown", 0
                     top_team_status = "unavailable"
                     try:
-                        for _page in range(1, 6):
-                            _page_data = await _fetch_json(
-                                client,
-                                "https://fantasy.premierleague.com/api/leagues-classic/314/standings/",
-                                params={"page_standings": _page},
-                            )
-                            standings = _page_data.get("standings", {})
-                            _entries = standings.get("results", [])
-                            for _e in _entries:
-                                if _e.get("event_total", 0) > top_pts:
-                                    top_pts = _e["event_total"]
-                                    top_tid = _e["entry"]
-                                    top_name = _e.get("entry_name", "Unknown")
-                            if not standings.get("has_next", False):
-                                break
+                        gw_event = next((e for e in bootstrap_events if e.get("id") == gw_id), None)
+                        if gw_event:
+                            top_tid = gw_event.get("highest_scoring_entry") or 0
+                            top_pts = gw_event.get("highest_score") or 0
+                        # Fetch the team name from their FPL entry info
                         if top_tid:
+                            try:
+                                entry_info = await _fetch_json(
+                                    client,
+                                    f"https://fantasy.premierleague.com/api/entry/{top_tid}/",
+                                )
+                                top_name = entry_info.get("name") or "Unknown"
+                            except Exception:
+                                top_name = f"Entry {top_tid}"
                             top_team_status = "ok"
                     except Exception as _fetch_exc:
-                        logger.warning(f"top-team standings fetch failed GW{gw_id}: {_fetch_exc}")
+                        logger.warning(f"top-team fetch failed GW{gw_id}: {_fetch_exc}")
                         top_team_status = "unavailable"
 
                     if top_tid:
@@ -583,10 +776,13 @@ async def auto_resolve_oracle(
                                     (p["element"] for p in top_picks if p.get("is_captain")), None
                                 )
 
-                                # Map player IDs to names using live data + DB
+                                # Map player IDs to names and element_type using live data + DB
                                 pid_to_name: dict[int, str] = {}
+                                pid_to_element_type: dict[int, int] = {}
                                 for e in live_payload.get("elements", []):
                                     pid_to_name[e["id"]] = e.get("web_name", str(e["id"]))
+                                    if e.get("element_type"):
+                                        pid_to_element_type[e["id"]] = e["element_type"]
 
                                 top_player_names = [pid_to_name.get(pid, str(pid)) for pid in xi_pids]
                                 top_captain_name = pid_to_name.get(cap_id, "") if cap_id else None
@@ -595,6 +791,11 @@ async def auto_resolve_oracle(
                                 oracle_xi_set = set(oracle_xi_ids)
                                 missed_pids = [pid for pid in xi_pids if pid not in oracle_xi_set]
                                 missed_players = [pid_to_name.get(pid, str(pid)) for pid in missed_pids]
+                                missed_players_with_pos = [
+                                    (pid_to_name.get(pid, str(pid)), pid_to_element_type.get(pid, 0))
+                                    for pid in missed_pids
+                                    if pid_to_element_type.get(pid)
+                                ]
                                 top_team_status = "ok"
                             except Exception as top_picks_exc:
                                 logger.warning(f"top-team picks fetch failed GW{gw_id}: {top_picks_exc}")
@@ -669,6 +870,7 @@ async def auto_resolve_oracle(
                                     oracle_xi=oracle_names_xi,
                                     top_xi=top_player_names,
                                     chip_miss_reason=chip_miss_reason,
+                                    missed_players_with_pos=missed_players_with_pos,
                                 )
                                 snapshot.oracle_blind_spots_json = json.dumps(blind_spots)
                             except Exception as learn_exc:

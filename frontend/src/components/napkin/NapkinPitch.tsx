@@ -8,6 +8,7 @@ interface NapkinPitchProps {
   picks: SquadPick[];
   livePoints?: Record<number, number>;
   large?: boolean;
+  isLiveGw?: boolean;
 }
 
 function groupByRole(picks: SquadPick[]) {
@@ -27,11 +28,13 @@ function PitchRow({
   livePoints,
   startIndex,
   large,
+  isLiveGw,
 }: {
   players: SquadPick[];
   livePoints?: Record<number, number>;
   startIndex: number;
   large?: boolean;
+  isLiveGw?: boolean;
 }) {
   const { selectedPlayerId, setSelectedPlayer } = useFPLStore();
   return (
@@ -45,13 +48,14 @@ function PitchRow({
           onSelect={setSelectedPlayer}
           isSelected={selectedPlayerId === pick.player_id}
           large={large}
+          isLiveGw={isLiveGw}
         />
       ))}
     </div>
   );
 }
 
-function BenchRow({ bench, livePoints, large }: { bench: SquadPick[]; livePoints?: Record<number, number>; large?: boolean }) {
+function BenchRow({ bench, livePoints, large, isLiveGw }: { bench: SquadPick[]; livePoints?: Record<number, number>; large?: boolean; isLiveGw?: boolean }) {
   const { selectedPlayerId, setSelectedPlayer } = useFPLStore();
   return (
     <div style={{ display: "flex", gap: large ? 14 : 10, justifyContent: "center", alignItems: "center" }}>
@@ -65,13 +69,14 @@ function BenchRow({ bench, livePoints, large }: { bench: SquadPick[]; livePoints
           onSelect={setSelectedPlayer}
           isSelected={selectedPlayerId === pick.player_id}
           large={large}
+          isLiveGw={isLiveGw}
         />
       ))}
     </div>
   );
 }
 
-export default function NapkinPitch({ picks, livePoints, large }: NapkinPitchProps) {
+export default function NapkinPitch({ picks, livePoints, large, isLiveGw }: NapkinPitchProps) {
   const { gk, def, mid, fwd, bench } = groupByRole(picks);
   const { squad, freeTransfers, bankMillions, selectedPlayerId, setSelectedPlayer } = useFPLStore();
 
@@ -216,10 +221,10 @@ export default function NapkinPitch({ picks, livePoints, large }: NapkinPitchPro
                 gap: large ? 14 : 10,
               }}
             >
-              <PitchRow players={fwd} livePoints={livePoints} startIndex={0} large={large} />
-              <PitchRow players={mid} livePoints={livePoints} startIndex={fwd.length} large={large} />
-              <PitchRow players={def} livePoints={livePoints} startIndex={fwd.length + mid.length} large={large} />
-              <PitchRow players={gk}  livePoints={livePoints} startIndex={fwd.length + mid.length + def.length} large={large} />
+              <PitchRow players={fwd} livePoints={livePoints} startIndex={0} large={large} isLiveGw={isLiveGw} />
+              <PitchRow players={mid} livePoints={livePoints} startIndex={fwd.length} large={large} isLiveGw={isLiveGw} />
+              <PitchRow players={def} livePoints={livePoints} startIndex={fwd.length + mid.length} large={large} isLiveGw={isLiveGw} />
+              <PitchRow players={gk}  livePoints={livePoints} startIndex={fwd.length + mid.length + def.length} large={large} isLiveGw={isLiveGw} />
             </div>
           </div>
         </div>
@@ -245,7 +250,7 @@ export default function NapkinPitch({ picks, livePoints, large }: NapkinPitchPro
           >
             bench
           </p>
-          <BenchRow bench={bench} livePoints={livePoints} large={large} />
+          <BenchRow bench={bench} livePoints={livePoints} large={large} isLiveGw={isLiveGw} />
         </div>
       </div>
 

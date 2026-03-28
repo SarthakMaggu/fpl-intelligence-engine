@@ -3,6 +3,10 @@ fastapi==0.135.0
 uvicorn[standard]==0.41.0
 python-multipart==0.0.20
 
+# Auth (admin panel)
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+
 # Database
 sqlalchemy[asyncio]==2.0.41
 asyncpg==0.30.0
@@ -35,6 +39,7 @@ scipy==1.15.3
 lightgbm==4.6.0
 scikit-learn==1.6.1
 joblib==1.5.1
+shap==0.46.0
 
 # Optimization
 PuLP==2.9.0

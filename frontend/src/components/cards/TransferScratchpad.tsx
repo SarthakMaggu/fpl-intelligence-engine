@@ -11,6 +11,7 @@ interface Props {
   bankMillions: number;
   optimalSquad?: OptimalSquad | null;
   benchStrategies?: BenchStrategy[];
+  rateLimited?: boolean;
 }
 
 function Divider() {
@@ -25,7 +26,7 @@ const REC_CONFIG = {
 
 const POS_LABEL: Record<number, string> = { 1: "GK", 2: "DEF", 3: "MID", 4: "FWD" };
 
-export default function TransferScratchpad({ suggestions, freeTransfers, bankMillions, optimalSquad, benchStrategies = [] }: Props) {
+export default function TransferScratchpad({ suggestions, freeTransfers, bankMillions, optimalSquad, benchStrategies = [], rateLimited = false }: Props) {
   const top = suggestions.slice(0, 2);
   const [showIlpInfo, setShowIlpInfo] = useState(false);
 
@@ -46,6 +47,15 @@ export default function TransferScratchpad({ suggestions, freeTransfers, bankMil
 
   // Number of extra transfers beyond free budget
   const extraTransfers = Math.max(0, (optimalSquad?.transfers_needed ?? 0) - freeTransfers);
+
+  // Net xPts gain from ILP plan (sum of in-out differences minus hit cost)
+  const ilpNetGain = optimalSquad
+    ? allIlpMoves.reduce((sum, m) => {
+        const inXp = m.inn?.predicted_xpts_next ?? 0;
+        const outXp = m.out.predicted_xpts_next ?? 0;
+        return sum + (inXp - outXp);
+      }, 0) - (optimalSquad.point_deduction ?? 0)
+    : null;
 
   // Free bench↔XI swaps (no transfer cost)
   const benchSwaps: BenchSwap[] = optimalSquad?.bench_swaps ?? [];
@@ -119,7 +129,30 @@ export default function TransferScratchpad({ suggestions, freeTransfers, bankMil
       <div style={{ padding: "14px 18px 18px", position: "relative", zIndex: 1 }}>
 
         {/* ── Greedy suggestions ──────────────────────────────── */}
-        {top.length === 0 && !optimalSquad && (
+        {top.length === 0 && !optimalSquad && rateLimited && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            style={{ textAlign: "center", padding: "24px 0", fontFamily: "var(--font-ui)" }}
+          >
+            <AlertTriangle size={20} style={{ color: "var(--amber)", margin: "0 auto 10px", display: "block" }} />
+            <div
+              style={{
+                fontFamily: "var(--font-display)",
+                fontSize: 13,
+                fontWeight: 600,
+                color: "var(--text-2)",
+                letterSpacing: "-0.01em",
+              }}
+            >
+              Analysis loading
+            </div>
+            <div style={{ fontSize: 11, color: "var(--text-3)", marginTop: 4, lineHeight: 1.5, maxWidth: 200, margin: "4px auto 0" }}>
+              Transfer analysis is computing — refresh in a few seconds or sync your squad to trigger a fresh analysis.
+            </div>
+          </motion.div>
+        )}
+        {top.length === 0 && !optimalSquad && !rateLimited && (
           <motion.div
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
@@ -467,16 +500,18 @@ export default function TransferScratchpad({ suggestions, freeTransfers, bankMil
                 </button>
               </div>
               <div style={{ display: "flex", gap: 5, alignItems: "center" }}>
-                <span
-                  style={{
-                    fontFamily: "var(--font-data)",
-                    fontSize: 12,
-                    color: "var(--text-2)",
-                    letterSpacing: "-0.02em",
-                  }}
-                >
-                  {optimalSquad.total_xpts.toFixed(1)} xP
-                </span>
+                {ilpNetGain !== null && allIlpMoves.length > 0 && (
+                  <span
+                    style={{
+                      fontFamily: "var(--font-data)",
+                      fontSize: 12,
+                      color: ilpNetGain >= 0 ? "var(--green)" : "var(--red)",
+                      letterSpacing: "-0.02em",
+                    }}
+                  >
+                    {ilpNetGain >= 0 ? "+" : ""}{ilpNetGain.toFixed(1)} xP gain
+                  </span>
+                )}
                 {optimalSquad.point_deduction > 0 ? (
                   <span
                     className="badge"
@@ -1084,6 +1119,7 @@ function ILPPlayerChip({
   const clr = accent === "red" ? "var(--red)" : "var(--green)";
   const bg = accent === "red" ? "rgba(239,68,68,0.05)" : "rgba(34,197,94,0.05)";
   const border = accent === "red" ? "rgba(239,68,68,0.15)" : "rgba(34,197,94,0.15)";
+  const [hovered, setHovered] = useState(false);
 
   return (
     <div
@@ -1098,9 +1134,36 @@ function ILPPlayerChip({
         padding: "6px 9px",
         gap: 6,
         minWidth: 0,
+        position: "relative",
       }}
+      onMouseEnter={() => setHovered(true)}
+      onMouseLeave={() => setHovered(false)}
     >
-      <div style={{ display: "flex", alignItems: "center", gap: 5, minWidth: 0 }}>
+      {/* Full-name tooltip — appears above chip on hover */}
+      {hovered && (
+        <div style={{
+          position: "absolute",
+          bottom: "calc(100% + 5px)",
+          left: "50%",
+          transform: "translateX(-50%)",
+          background: "var(--surface)",
+          border: "1px solid var(--divider)",
+          borderRadius: 6,
+          padding: "4px 9px",
+          fontFamily: "var(--font-display)",
+          fontSize: 11,
+          fontWeight: 600,
+          color: "var(--text-1)",
+          whiteSpace: "nowrap",
+          pointerEvents: "none",
+          zIndex: 50,
+          letterSpacing: "-0.01em",
+          boxShadow: "0 4px 16px rgba(0,0,0,0.4)",
+        }}>
+          {name}
+        </div>
+      )}
+      <div style={{ display: "flex", alignItems: "center", gap: 5, minWidth: 0, flex: 1 }}>
         <span
           style={{
             fontFamily: "var(--font-ui)",
@@ -1152,6 +1215,8 @@ function ILPPlayerChip({
             overflow: "hidden",
             whiteSpace: "nowrap",
             textOverflow: "ellipsis",
+            flex: 1,
+            minWidth: 0,
           }}
         >
           {name}

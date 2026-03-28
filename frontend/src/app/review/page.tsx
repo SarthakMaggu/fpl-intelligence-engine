@@ -2,7 +2,7 @@
 import { useEffect, useState } from "react";
 import { motion } from "framer-motion";
 import {
-  CheckCircle, XCircle, Clock, TrendingUp, TrendingDown,
+  CheckCircle, XCircle, Clock,
   RefreshCw, ArrowLeftRight, Zap,
 } from "lucide-react";
 import BottomDock from "@/components/BottomDock";
@@ -18,6 +18,11 @@ interface Decision {
   user_choice?: string | null;
   expected_points?: number | null;
   actual_points?: number | null;
+  actual_gain?: number | null;        // decision-specific gain/loss (player score)
+  player_id_primary?: number | null;  // captain player / player_in FPL id
+  player_id_secondary?: number | null; // player_out FPL id (transfers)
+  player_team_code?: number | null;   // FPL team code for badge (primary player)
+  player_out_team_code?: number | null; // FPL team code for badge (secondary/out player)
   decision_followed?: boolean | null;
   reasoning?: string | null;
   notes?: string | null;
@@ -35,8 +40,8 @@ interface GWReview {
     pending_resolution: number;
     adherence_rate: number;
     expected_points_if_followed: number;
-    actual_points_followed: number;
-    gain_vs_ai_pts?: number | null;
+    actual_gw_points?: number | null;
+    actual_points_followed?: number | null;
   };
   user_gw_performance?: {
     gw_points?: number | null;
@@ -45,7 +50,7 @@ interface GWReview {
     transfer_cost?: number | null;
     chip_played?: string | null;
     points_on_bench?: number | null;
-    avg_gw_pts?: number | null;
+    fpl_avg_pts?: number | null;  // FPL overall average for this GW
   } | null;
   decisions: Decision[];
 }
@@ -106,7 +111,10 @@ interface SeasonReview {
     adherence_rate: number;
     avg_expected: number;
     avg_actual: number;
+    avg_actual_gain: number | null;
+    last_actual_gain: number | null;
   }>;
+  decisions?: Decision[];  // individual decision rows for per-decision audit
   message?: string;
 }
 
@@ -184,10 +192,32 @@ function DecisionCard({ d }: { d: Decision }) {
         <AdherenceBadge followed={d.decision_followed} />
       </div>
 
-      {/* Main recommendation text */}
+      {/* Main recommendation text with team badges */}
       {!isChip && (
-        <div style={{ fontFamily: "var(--font-ui)", fontSize: 13, fontWeight: 600, color: "var(--text-1)", marginBottom: 4 }}>
-          {d.recommended_option}
+        <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
+          {/* Transfers: OUT badge first, then IN badge */}
+          {d.player_out_team_code != null && d.player_out_team_code > 0 && (
+            // eslint-disable-next-line @next/next/no-img-element
+            <img
+              src={`https://resources.premierleague.com/premierleague/badges/25/t${d.player_out_team_code}.png`}
+              alt="" width={18} height={18}
+              style={{ objectFit: "contain", opacity: 0.7, flexShrink: 0 }}
+              onError={(e) => { (e.target as HTMLImageElement).style.display = "none"; }}
+            />
+          )}
+          {/* Captain / transfer IN: primary player badge */}
+          {d.player_team_code != null && d.player_team_code > 0 && (
+            // eslint-disable-next-line @next/next/no-img-element
+            <img
+              src={`https://resources.premierleague.com/premierleague/badges/25/t${d.player_team_code}.png`}
+              alt="" width={18} height={18}
+              style={{ objectFit: "contain", opacity: 0.9, flexShrink: 0 }}
+              onError={(e) => { (e.target as HTMLImageElement).style.display = "none"; }}
+            />
+          )}
+          <span style={{ fontFamily: "var(--font-ui)", fontSize: 13, fontWeight: 600, color: "var(--text-1)" }}>
+            {d.recommended_option}
+          </span>
         </div>
       )}
 
@@ -200,25 +230,38 @@ function DecisionCard({ d }: { d: Decision }) {
         </div>
       )}
 
-      {/* Points row — only for transfers/captain decisions with meaningful data */}
-      {(showExpected || d.actual_points != null) && (
-        <div style={{ display: "flex", gap: 12, marginTop: 6 }}>
+      {/* Points row — expected xPts and actual gain for this decision */}
+      {(showExpected || d.actual_gain != null) && (
+        <div style={{ display: "flex", gap: 12, marginTop: 6, alignItems: "flex-end" }}>
           {showExpected && (
             <div>
-              <div style={{ fontSize: 9, color: "var(--text-3)", fontFamily: "var(--font-ui)", letterSpacing: "0.06em", textTransform: "uppercase" }}>expected</div>
+              <div style={{ fontSize: 9, color: "var(--text-3)", fontFamily: "var(--font-ui)", letterSpacing: "0.06em", textTransform: "uppercase" }}>predicted</div>
               <div style={{ fontFamily: "var(--font-data)", fontSize: 14, color: "var(--text-2)", fontWeight: 600 }}>
                 +{d.expected_points!.toFixed(1)}
               </div>
             </div>
           )}
-          {d.actual_points != null && (
+          {d.actual_gain != null && d.decision_followed && (
             <div>
-              <div style={{ fontSize: 9, color: "var(--text-3)", fontFamily: "var(--font-ui)", letterSpacing: "0.06em", textTransform: "uppercase" }}>actual</div>
+              <div style={{ fontSize: 9, color: "var(--text-3)", fontFamily: "var(--font-ui)", letterSpacing: "0.06em", textTransform: "uppercase" }}>
+                {d.decision_type?.toLowerCase().includes("captain") ? "captain scored" : "net gain"}
+              </div>
               <div style={{
-                fontFamily: "var(--font-data)", fontSize: 14, fontWeight: 600,
-                color: d.actual_points >= (d.expected_points || 0) ? "var(--green)" : "var(--red)",
+                fontFamily: "var(--font-data)", fontSize: 14, fontWeight: 700,
+                color: d.actual_gain >= 0 ? "var(--green)" : "var(--red)",
               }}>
-                {d.actual_points >= 0 ? "+" : ""}{d.actual_points.toFixed(1)}
+                {d.actual_gain >= 0 ? "+" : ""}{d.actual_gain.toFixed(1)} pts
+              </div>
+            </div>
+          )}
+          {d.actual_gain != null && !d.decision_followed && (
+            <div>
+              <div style={{ fontSize: 9, color: "var(--text-3)", fontFamily: "var(--font-ui)", letterSpacing: "0.06em", textTransform: "uppercase" }}>would have gained</div>
+              <div style={{
+                fontFamily: "var(--font-data)", fontSize: 14, fontWeight: 700,
+                color: "var(--text-3)", opacity: 0.7,
+              }}>
+                {d.actual_gain >= 0 ? "+" : ""}{d.actual_gain.toFixed(1)} pts
               </div>
             </div>
           )}
@@ -288,6 +331,8 @@ interface OracleSnapshot {
   oracle_beat_top: boolean | null;
   missed_players: string[];
   blind_spots: BlindSpots | null;
+  gw_average?: number | null;
+  oracle_vs_avg?: number | null;
 }
 
 interface CrossCheckResult {
@@ -315,15 +360,6 @@ export default function ReviewPage() {
   const [autoResolving, setAutoResolving] = useState(false);
   const [liveGwPts, setLiveGwPts] = useState<number | null>(null);
 
-  // Load persisted cross-check from localStorage on mount
-  useEffect(() => {
-    if (!teamId) return;
-    const saved = typeof window !== "undefined" ? localStorage.getItem(`fpl_crosscheck_${teamId}`) : null;
-    if (saved) {
-      try { setCrossCheck(JSON.parse(saved)); } catch { /* ignore */ }
-    }
-  }, [teamId]);
-
   const load = async () => {
     if (!teamId) { setLoading(false); return; }
     setLoading(true);
@@ -337,16 +373,41 @@ export default function ReviewPage() {
         fetch(`${API}/api/gameweeks/current`),
       ]);
       let loadedGwReview: GWReview | null = null;
-      if (gwRes.ok) { loadedGwReview = await gwRes.json(); setGwReview(loadedGwReview); }
+      let fplCurrentGwId = 0; // actual is_current GW from FPL (not planning GW)
+      if (gwRes.ok) {
+        loadedGwReview = await gwRes.json();
+        setGwReview(loadedGwReview);
+        // Load cross-check keyed by GW — prevents stale data from a prior GW
+        if (loadedGwReview && typeof window !== "undefined") {
+          const ccKey = `fpl_crosscheck_${teamId}_gw${loadedGwReview.gameweek_id}`;
+          const saved = localStorage.getItem(ccKey);
+          if (saved) {
+            try {
+              const parsed = JSON.parse(saved);
+              if (parsed && typeof parsed.verified_count === "number" && typeof parsed.total_checks === "number") {
+                setCrossCheck(parsed);
+              } else {
+                localStorage.removeItem(ccKey);
+                setCrossCheck(null);
+              }
+            } catch { setCrossCheck(null); }
+          } else {
+            setCrossCheck(null); // clear stale result from a previous GW
+          }
+        }
+      }
       if (seasonRes.ok) setSeasonReview(await seasonRes.json());
+      let loadedSnapshots: OracleSnapshot[] = [];
       if (oracleRes.ok) {
         const d = await oracleRes.json();
-        setOracleHistory(d.snapshots || []);
+        loadedSnapshots = d.snapshots || [];
+        setOracleHistory(loadedSnapshots);
       }
       if (txRes.ok) setTransfersReview(await txRes.json());
       if (chipRes.ok) setActiveChip(await chipRes.json());
       if (gwStateRes.ok) {
         const gwStateData = await gwStateRes.json();
+        fplCurrentGwId = gwStateData.current_gw ?? 0;
         setGwStateStr(gwStateData.state || null);
         // Fetch live score when GW is active (deadline passed but not finished)
         if (gwStateData.state === "deadline_passed" && teamId) {
@@ -359,9 +420,9 @@ export default function ReviewPage() {
             }
           } catch { /* non-fatal */ }
         }
-        // Auto-run cross-check when deadline has passed and no saved result
+        // Auto-run cross-check when deadline has passed and no saved result for THIS GW
         if (gwStateData.state === "deadline_passed" && loadedGwReview) {
-          const savedKey = `fpl_crosscheck_${teamId}`;
+          const savedKey = `fpl_crosscheck_${teamId}_gw${loadedGwReview.gameweek_id}`;
           const savedRaw = typeof window !== "undefined" ? localStorage.getItem(savedKey) : null;
           if (!savedRaw) {
             // Run cross-check silently
@@ -381,6 +442,55 @@ export default function ReviewPage() {
             finally { setCrossChecking(false); }
           }
         }
+      }
+      // ── Oracle auto-actions (silent, on page load) ──────────────────────────
+      // 1. Compute snapshot if no snapshot exists for the CURRENT GW.
+      //    Use the FPL is_current GW (e.g. GW31), NOT the latest decision GW (which
+      //    may be GW32 planning). This prevents an infinite loop where GW32 planning
+      //    decisions cause us to keep recreating a GW32 snapshot that the backend
+      //    intentionally excludes from history (unresolved future GW).
+      const currentGwId = fplCurrentGwId || (loadedGwReview?.gameweek_id ?? 0);
+      const latestSnapshotGw = loadedSnapshots.length > 0
+        ? Math.max(...loadedSnapshots.map((s: OracleSnapshot) => s.gameweek_id))
+        : 0;
+      const missingCurrentGwSnapshot = currentGwId > 0 && !loadedSnapshots.some(
+        (s: OracleSnapshot) => s.gameweek_id === currentGwId
+      );
+      if (missingCurrentGwSnapshot && teamId) {
+        try {
+          setTakingSnapshot(true);
+          // Compute for current GW first
+          await fetch(`${API}/api/oracle/snapshot?team_id=${teamId}`, { method: "POST" });
+          // If there's a gap (e.g. GW30→GW32, missing GW31), backfill it
+          if (latestSnapshotGw > 0 && currentGwId - latestSnapshotGw > 1) {
+            await fetch(`${API}/api/oracle/backfill?team_id=${teamId}&from_gw=${latestSnapshotGw + 1}&to_gw=${currentGwId - 1}`, { method: "POST" });
+          }
+          const refreshed = await fetch(`${API}/api/oracle/history?team_id=${teamId}&limit=10`);
+          if (refreshed.ok) {
+            const rd = await refreshed.json();
+            loadedSnapshots = rd.snapshots || [];
+            setOracleHistory(loadedSnapshots);
+          }
+        } catch { /* non-fatal */ }
+        finally { setTakingSnapshot(false); }
+      }
+
+      // 2. If snapshots exist but some are unresolved → auto-resolve silently.
+      //    Backend only resolves finished GWs, so this is always safe to call.
+      const hasUnresolved_ = loadedSnapshots.some(
+        (s: OracleSnapshot) => !s.resolved || s.actual_algo_points == null || s.actual_oracle_points == null || !s.top_team || s.top_team?.status === "unavailable"
+      );
+      if (hasUnresolved_ && teamId && loadedSnapshots.length > 0) {
+        try {
+          setAutoResolving(true);
+          await fetch(`${API}/api/oracle/auto-resolve?team_id=${teamId}`, { method: "POST" });
+          const refreshed = await fetch(`${API}/api/oracle/history?team_id=${teamId}&limit=10`);
+          if (refreshed.ok) {
+            const rd = await refreshed.json();
+            setOracleHistory(rd.snapshots || []);
+          }
+        } catch { /* non-fatal */ }
+        finally { setAutoResolving(false); }
       }
     } catch { /* silent */ }
     finally { setLoading(false); }
@@ -417,7 +527,7 @@ export default function ReviewPage() {
         const data = await res.json();
         setCrossCheck(data);
         if (typeof window !== "undefined") {
-          localStorage.setItem(`fpl_crosscheck_${teamId}`, JSON.stringify(data));
+          localStorage.setItem(`fpl_crosscheck_${teamId}_gw${gwReview.gameweek_id}`, JSON.stringify(data));
         }
         await load(); // refresh so decision_followed flags update
       }
@@ -616,104 +726,9 @@ function GWView({
           </div>
         </div>
 
-        {/* Gain vs recommendations */}
-        {summary.gain_vs_ai_pts != null && (
-          <div style={{
-            display: "flex",
-            alignItems: "center",
-            gap: 6,
-            padding: "8px 10px",
-            background: summary.gain_vs_ai_pts >= 0 ? "rgba(34,197,94,0.08)" : "rgba(239,68,68,0.08)",
-            borderRadius: 8,
-            border: `1px solid ${summary.gain_vs_ai_pts >= 0 ? "rgba(34,197,94,0.2)" : "rgba(239,68,68,0.2)"}`,
-          }}>
-            {summary.gain_vs_ai_pts >= 0
-              ? <TrendingUp size={13} style={{ color: "var(--green)" }} />
-              : <TrendingDown size={13} style={{ color: "var(--red)" }} />}
-            <span style={{ fontFamily: "var(--font-data)", fontSize: 13, color: summary.gain_vs_ai_pts >= 0 ? "var(--green)" : "var(--red)", fontWeight: 600 }}>
-              {summary.gain_vs_ai_pts >= 0 ? "+" : ""}{summary.gain_vs_ai_pts.toFixed(1)} pts vs recommendation
-            </span>
-          </div>
-        )}
+
       </motion.div>
 
-      {/* ── Cross-check with real FPL squad ─────────────────── */}
-      <div style={{ marginBottom: 16 }}>
-        {crossChecking && !crossCheck ? (
-          <div style={{ width: "100%", padding: "10px 16px", borderRadius: 10, background: "var(--surface)", border: "1px solid var(--divider)", fontFamily: "var(--font-ui)", fontSize: 11, color: "var(--text-3)", letterSpacing: "0.02em", textAlign: "center" }}>
-            Verifying with FPL API…
-          </div>
-        ) : !crossCheck ? (
-          <button
-            onClick={onCrossCheck}
-            disabled={crossChecking}
-            style={{
-              width: "100%",
-              padding: "10px 16px", borderRadius: 10,
-              background: "var(--surface)",
-              border: "1px solid var(--divider)",
-              cursor: crossChecking ? "default" : "pointer",
-              color: crossChecking ? "var(--text-3)" : "var(--text-2)",
-              fontFamily: "var(--font-ui)", fontSize: 11, fontWeight: 500,
-              letterSpacing: "0.02em",
-              transition: "border-color 150ms",
-            }}
-            onMouseEnter={(e) => { if (!crossChecking) (e.currentTarget as HTMLButtonElement).style.borderColor = "rgba(255,255,255,0.2)"; }}
-            onMouseLeave={(e) => { (e.currentTarget as HTMLButtonElement).style.borderColor = "var(--divider)"; }}
-          >
-            Verify against real FPL squad
-          </button>
-        ) : (
-          <motion.div
-            initial={{ opacity: 0 }}
-            animate={{ opacity: 1 }}
-            style={{
-              padding: "12px 16px", borderRadius: 10,
-              background: "var(--surface)",
-              border: "1px solid var(--divider)",
-            }}
-          >
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-              <div>
-                <div style={{ fontFamily: "var(--font-ui)", fontSize: 10, color: "var(--text-3)", letterSpacing: "0.1em", textTransform: "uppercase", marginBottom: 4 }}>
-                  Squad verification
-                </div>
-                <div style={{ fontFamily: "var(--font-display)", fontSize: 14, fontWeight: 600, color: crossCheck.total_checks === 0 ? "var(--text-2)" : crossCheck.verified ? "var(--green)" : "var(--text-2)", letterSpacing: "-0.02em" }}>
-                  {crossCheck.total_checks === 0
-                    ? "No decisions to verify"
-                    : `${crossCheck.verified_count} of ${crossCheck.total_checks} confirmed`}
-                </div>
-                {crossCheck.real_captain && (
-                  <div style={{ fontFamily: "var(--font-ui)", fontSize: 10, color: "var(--text-3)", marginTop: 3 }}>
-                    Captain · {crossCheck.real_captain}
-                  </div>
-                )}
-              </div>
-              <div>
-                <div style={{
-                  fontFamily: "var(--font-data)", fontSize: 22, fontWeight: 700,
-                  color: crossCheck.total_checks === 0 ? "var(--text-3)" : crossCheck.verified ? "var(--green)" : "var(--text-2)",
-                  letterSpacing: "-0.04em", textAlign: "right",
-                }}>
-                  {crossCheck.total_checks === 0 ? "—" : `${Math.round(crossCheck.verified_count / Math.max(crossCheck.total_checks, 1) * 100)}%`}
-                </div>
-                {/* Show re-run button only when not auto-verified after deadline */}
-                {gwState !== "deadline_passed" && (
-                  <button
-                    onClick={onCrossCheck}
-                    style={{
-                      marginTop: 4, padding: "2px 8px", borderRadius: 6,
-                      background: "transparent", border: "1px solid var(--divider)",
-                      cursor: "pointer", color: "var(--text-3)",
-                      fontFamily: "var(--font-ui)", fontSize: 9, letterSpacing: "0.04em",
-                    }}
-                  >re-check</button>
-                )}
-              </div>
-            </div>
-          </motion.div>
-        )}
-      </div>
 
       {/* Active chip — inline with performance stats, no robotic icons */}
       {activeChip?.chip && (
@@ -756,6 +771,28 @@ function GWView({
               Your performance
             </div>
           </div>
+          {/* GW in play — always show live-only view when deadline_passed, regardless of partial history */}
+          {gwState === "deadline_passed" ? (
+            <div style={{ display: "flex", gap: 8 }}>
+              {liveGwPts != null && (
+                <div style={{ flex: 1, textAlign: "center", padding: "8px 6px", borderRadius: 8, background: "rgba(245,158,11,0.07)", border: "1px solid rgba(245,158,11,0.2)" }}>
+                  <div style={{ fontFamily: "var(--font-data)", fontSize: 20, fontWeight: 700, color: "var(--amber)" }}>{liveGwPts}</div>
+                  <div style={{ fontFamily: "var(--font-ui)", fontSize: 8, color: "var(--amber)", textTransform: "uppercase", letterSpacing: "0.06em", opacity: 0.8 }}>live pts</div>
+                </div>
+              )}
+              {perf?.overall_rank != null && perf.overall_rank > 0 && (
+                <div style={{ flex: 1, textAlign: "center", padding: "8px 6px", borderRadius: 8, background: "rgba(255,255,255,0.03)", border: "1px solid var(--divider)" }}>
+                  <div style={{ fontFamily: "var(--font-data)", fontSize: 20, fontWeight: 700, color: "var(--text-1)" }}>{perf.overall_rank.toLocaleString()}</div>
+                  <div style={{ fontFamily: "var(--font-ui)", fontSize: 8, color: "var(--text-3)", textTransform: "uppercase", letterSpacing: "0.06em" }}>rank</div>
+                </div>
+              )}
+              <div style={{ flex: 2, padding: "8px 10px", borderRadius: 8, background: "rgba(255,255,255,0.02)", border: "1px solid var(--divider)", display: "flex", alignItems: "center" }}>
+                <span style={{ fontFamily: "var(--font-ui)", fontSize: 9, color: "var(--text-3)", lineHeight: 1.5 }}>
+                  Avg pts &amp; bench pts update after all GW fixtures finish.
+                </span>
+              </div>
+            </div>
+          ) : (
           <div style={{ display: "flex", gap: 8 }}>
             {/* Live pts — primary when GW active */}
             {liveGwPts != null && (
@@ -765,32 +802,33 @@ function GWView({
               </div>
             )}
             {/* Settled GW pts — only when no live score */}
-            {perf?.gw_points != null && liveGwPts == null && (
+            {perf?.gw_points != null && perf.gw_points > 0 && liveGwPts == null && (
               <div style={{ flex: 1, textAlign: "center", padding: "8px 6px", borderRadius: 8, background: "rgba(255,255,255,0.03)", border: "1px solid var(--divider)" }}>
                 <div style={{ fontFamily: "var(--font-data)", fontSize: 20, fontWeight: 700, color: "var(--text-1)" }}>{perf.gw_points}</div>
                 <div style={{ fontFamily: "var(--font-ui)", fontSize: 8, color: "var(--text-3)", textTransform: "uppercase", letterSpacing: "0.06em" }}>GW pts</div>
               </div>
             )}
-            {/* Average GW score */}
-            {perf?.avg_gw_pts != null && (
+            {/* FPL overall GW average — labelled clearly */}
+            {perf?.fpl_avg_pts != null && perf.fpl_avg_pts > 0 && (
               <div style={{ flex: 1, textAlign: "center", padding: "8px 6px", borderRadius: 8, background: "rgba(255,255,255,0.03)", border: "1px solid var(--divider)" }}>
-                <div style={{ fontFamily: "var(--font-data)", fontSize: 20, fontWeight: 700, color: "var(--text-3)" }}>{perf.avg_gw_pts}</div>
-                <div style={{ fontFamily: "var(--font-ui)", fontSize: 8, color: "var(--text-3)", textTransform: "uppercase", letterSpacing: "0.06em" }}>avg pts</div>
+                <div style={{ fontFamily: "var(--font-data)", fontSize: 20, fontWeight: 700, color: "var(--text-3)" }}>{perf.fpl_avg_pts}</div>
+                <div style={{ fontFamily: "var(--font-ui)", fontSize: 8, color: "var(--text-3)", textTransform: "uppercase", letterSpacing: "0.06em" }}>FPL avg</div>
               </div>
             )}
-            {perf?.overall_rank != null && (
+            {perf?.overall_rank != null && perf.overall_rank > 0 && (
               <div style={{ flex: 1, textAlign: "center", padding: "8px 6px", borderRadius: 8, background: "rgba(255,255,255,0.03)", border: "1px solid var(--divider)" }}>
                 <div style={{ fontFamily: "var(--font-data)", fontSize: 20, fontWeight: 700, color: "var(--text-1)" }}>{perf.overall_rank.toLocaleString()}</div>
                 <div style={{ fontFamily: "var(--font-ui)", fontSize: 8, color: "var(--text-3)", textTransform: "uppercase", letterSpacing: "0.06em" }}>rank</div>
               </div>
             )}
-            {perf?.points_on_bench != null && (
+            {perf?.points_on_bench != null && perf.points_on_bench > 0 && (
               <div style={{ flex: 1, textAlign: "center", padding: "8px 6px", borderRadius: 8, background: "rgba(255,255,255,0.03)", border: "1px solid var(--divider)" }}>
                 <div style={{ fontFamily: "var(--font-data)", fontSize: 20, fontWeight: 700, color: "var(--text-1)" }}>{perf.points_on_bench}</div>
                 <div style={{ fontFamily: "var(--font-ui)", fontSize: 8, color: "var(--text-3)", textTransform: "uppercase", letterSpacing: "0.06em" }}>bench pts</div>
               </div>
             )}
           </div>
+          )}
           {perf?.chip_played && (
             <div style={{ marginTop: 8, padding: "4px 8px", background: "rgba(245,158,11,0.1)", border: "1px solid rgba(245,158,11,0.25)", borderRadius: 6, fontSize: 10, color: "var(--amber)", fontFamily: "var(--font-ui)", display: "inline-block" }}>
               Chip: {perf.chip_played}
@@ -1002,20 +1040,9 @@ function TransfersView({ review }: { review: TransfersReview | null }) {
             }}>
               {tx.ai_decision.expected_points != null && (
                 <div>
-                  <div style={{ fontFamily: "var(--font-ui)", fontSize: 8, color: "var(--text-3)", textTransform: "uppercase", letterSpacing: "0.06em" }}>expected</div>
+                  <div style={{ fontFamily: "var(--font-ui)", fontSize: 8, color: "var(--text-3)", textTransform: "uppercase", letterSpacing: "0.06em" }}>expected xP gain</div>
                   <div style={{ fontFamily: "var(--font-data)", fontSize: 13, color: "var(--text-2)", fontWeight: 600 }}>
                     {tx.ai_decision.expected_points.toFixed(1)}
-                  </div>
-                </div>
-              )}
-              {tx.ai_decision.actual_points != null && (
-                <div>
-                  <div style={{ fontFamily: "var(--font-ui)", fontSize: 8, color: "var(--text-3)", textTransform: "uppercase", letterSpacing: "0.06em" }}>actual</div>
-                  <div style={{
-                    fontFamily: "var(--font-data)", fontSize: 13, fontWeight: 600,
-                    color: tx.ai_decision.actual_points >= (tx.ai_decision.expected_points || 0) ? "var(--green)" : "var(--red)",
-                  }}>
-                    {tx.ai_decision.actual_points.toFixed(1)}
                   </div>
                 </div>
               )}
@@ -1034,12 +1061,370 @@ function TransfersView({ review }: { review: TransfersReview | null }) {
   );
 }
 
+// ── Accuracy verdict helpers ──────────────────────────────────────────────────
+
+const SEASON_CHIP_LABEL: Record<string, string> = {
+  triple_captain: "Triple Captain",
+  bench_boost: "Bench Boost",
+  free_hit: "Free Hit",
+  wildcard: "Wildcard",
+};
+
+function getSeasonDecisionLabel(d: Decision): string {
+  if (d.decision_type === "CHIP_USED") {
+    const key = (d.recommended_option || "").toLowerCase().replace(/\s+/g, "_");
+    return SEASON_CHIP_LABEL[key] || d.recommended_option || "Chip";
+  }
+  return d.decision_type
+    .replace(/_/g, " ")
+    .replace(/\b\w/g, (c) => c.toUpperCase());
+}
+
+function getSeasonDecisionColor(d: Decision): string {
+  const dt = (d.decision_type || "").toLowerCase();
+  const ro = (d.recommended_option || "").toLowerCase().replace(/\s+/g, "_");
+  if (dt.includes("captain")) return "var(--amber)";
+  if (dt === "chip_used" || dt === "chip") {
+    if (ro.includes("triple_captain")) return "var(--amber)";
+    if (ro.includes("free_hit")) return "var(--green)";
+    if (ro.includes("bench_boost")) return "var(--blue)";
+    return "var(--text-2)";
+  }
+  if (dt.includes("transfer")) return "var(--blue)";
+  return "var(--text-2)";
+}
+
+interface AccuracyVerdict {
+  label: string;
+  color: string;
+  errorPts: number;
+  errorPct: number;
+  modelLearn: string;
+}
+
+function computeAccuracyVerdict(
+  predicted: number | null | undefined,
+  actual: number | null | undefined,
+  followed: boolean | null | undefined,
+  dt: string
+): AccuracyVerdict | null {
+  if (predicted == null || predicted < 0.5) return null;
+  if (actual == null) return null;
+  if (!followed) return null;
+
+  const error = predicted - actual;
+  const absError = Math.abs(error);
+  const errorPct = (absError / Math.abs(predicted)) * 100;
+  const dtLower = dt.toLowerCase();
+  const thingName = dtLower.includes("captain")
+    ? "captaincy value"
+    : dtLower.includes("transfer")
+    ? "transfer gain"
+    : "impact value";
+
+  if (errorPct <= 20) {
+    return {
+      label: "ON TARGET",
+      color: "var(--green)",
+      errorPts: error,
+      errorPct,
+      modelLearn: "Accurate prediction. Model confidence reinforced — no adjustment needed.",
+    };
+  }
+  if (error > 0 && errorPct <= 50) {
+    return {
+      label: "SLIGHT OVERESTIMATE",
+      color: "var(--amber)",
+      errorPts: error,
+      errorPct,
+      modelLearn: `Model overestimated ${thingName} by ${errorPct.toFixed(0)}%. Within acceptable range — minor calibration applied.`,
+    };
+  }
+  if (error < 0 && errorPct <= 50) {
+    return {
+      label: "SLIGHT UNDERESTIMATE",
+      color: "var(--amber)",
+      errorPts: error,
+      errorPct,
+      modelLearn: `Model underestimated ${thingName} by ${errorPct.toFixed(0)}%. Within acceptable range — minor calibration applied.`,
+    };
+  }
+  if (error > 0) {
+    return {
+      label: "OVERESTIMATE",
+      color: "var(--red)",
+      errorPts: error,
+      errorPct,
+      modelLearn: `Model overestimated ${thingName} by ${errorPct.toFixed(0)}%. Learning: recalibrating xPts ceiling down for similar scenarios.`,
+    };
+  }
+  return {
+    label: "UNDERESTIMATE",
+    color: "var(--blue)",
+    errorPts: error,
+    errorPct,
+    modelLearn: `Model underestimated ${thingName} by ${errorPct.toFixed(0)}%. Learning: recalibrating xPts floor up for similar scenarios.`,
+  };
+}
+
+// ── Per-decision audit card ───────────────────────────────────────────────────
+
+function DecisionAuditCard({ d }: { d: Decision }) {
+  const color = getSeasonDecisionColor(d);
+  const label = getSeasonDecisionLabel(d);
+  const isChip = d.decision_type === "CHIP_USED" || d.decision_type.toLowerCase() === "chip";
+  const verdict = computeAccuracyVerdict(
+    d.expected_points,
+    d.actual_gain,
+    d.decision_followed,
+    d.decision_type
+  );
+
+  const showPredicted = d.expected_points != null && !(isChip && (d.expected_points === 0 || d.expected_points === 0.0));
+  const actualLabel = d.decision_type.toLowerCase().includes("captain")
+    ? "captain scored"
+    : "actual gain";
+
+  return (
+    <motion.div
+      initial={{ opacity: 0, y: 4 }}
+      animate={{ opacity: 1, y: 0 }}
+      style={{
+        borderRadius: 12,
+        background: "var(--surface)",
+        border: "1px solid var(--divider)",
+        borderLeft: `3px solid ${color}`,
+        marginBottom: 10,
+        overflow: "hidden",
+      }}
+    >
+      {/* Card header: GW badge + type label + followed/ignored */}
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "10px 14px 8px" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 7 }}>
+          <span style={{
+            fontFamily: "var(--font-ui)", fontSize: 9, fontWeight: 700,
+            color: "var(--text-3)", background: "rgba(255,255,255,0.04)",
+            border: "1px solid var(--divider)", borderRadius: 4, padding: "2px 6px",
+            letterSpacing: "0.06em",
+          }}>
+            GW{d.gameweek_id}
+          </span>
+          <span style={{
+            fontFamily: "var(--font-ui)", fontSize: 11, fontWeight: 700,
+            color, letterSpacing: "0.04em", textTransform: "uppercase",
+          }}>
+            {label}
+          </span>
+        </div>
+        {/* Followed / Ignored / Pending indicator */}
+        <span style={{
+          display: "flex", alignItems: "center", gap: 4,
+          fontFamily: "var(--font-ui)", fontSize: 10, fontWeight: 600,
+          color: d.decision_followed === true
+            ? "var(--green)"
+            : d.decision_followed === false
+            ? "var(--red)"
+            : "var(--text-3)",
+        }}>
+          {d.decision_followed === true
+            ? <><CheckCircle size={11} />Followed</>
+            : d.decision_followed === false
+            ? <><XCircle size={11} />Ignored</>
+            : <><Clock size={11} />Pending</>}
+        </span>
+      </div>
+
+      {/* Body */}
+      <div style={{ padding: "0 14px 12px" }}>
+        {/* What was recommended — with team badge(s) */}
+        <div style={{
+          display: "flex", alignItems: "center", gap: 8,
+          fontFamily: "var(--font-ui)", fontSize: 13, fontWeight: 600,
+          color: "var(--text-1)", marginBottom: 10, lineHeight: 1.3,
+        }}>
+          {!isChip && d.player_out_team_code != null && d.player_out_team_code > 0 && (
+            // eslint-disable-next-line @next/next/no-img-element
+            <img
+              src={`https://resources.premierleague.com/premierleague/badges/25/t${d.player_out_team_code}.png`}
+              alt="" width={20} height={20}
+              style={{ objectFit: "contain", opacity: 0.7, flexShrink: 0 }}
+              onError={(e) => { (e.target as HTMLImageElement).style.display = "none"; }}
+            />
+          )}
+          {!isChip && d.player_team_code != null && d.player_team_code > 0 && (
+            // eslint-disable-next-line @next/next/no-img-element
+            <img
+              src={`https://resources.premierleague.com/premierleague/badges/25/t${d.player_team_code}.png`}
+              alt="" width={20} height={20}
+              style={{ objectFit: "contain", opacity: 0.95, flexShrink: 0 }}
+              onError={(e) => { (e.target as HTMLImageElement).style.display = "none"; }}
+            />
+          )}
+          <span>
+            {isChip
+              ? `${SEASON_CHIP_LABEL[(d.recommended_option || "").toLowerCase().replace(/\s+/g, "_")] || d.recommended_option} chip`
+              : d.recommended_option}
+          </span>
+        </div>
+
+        {/* Predicted vs Actual numbers */}
+        {(showPredicted || d.actual_gain != null) && (
+          <div style={{ display: "flex", gap: 24, marginBottom: verdict || (d.decision_followed === false && showPredicted) ? 10 : 0, alignItems: "flex-end" }}>
+            {showPredicted && (
+              <div>
+                <div style={{
+                  fontFamily: "var(--font-ui)", fontSize: 8, color: "var(--text-3)",
+                  letterSpacing: "0.1em", textTransform: "uppercase", marginBottom: 3,
+                }}>
+                  model predicted
+                </div>
+                <div style={{
+                  fontFamily: "var(--font-data)", fontSize: 22, fontWeight: 700,
+                  color: "var(--text-2)", letterSpacing: "-0.04em",
+                }}>
+                  +{d.expected_points!.toFixed(1)}
+                  <span style={{ fontFamily: "var(--font-ui)", fontSize: 10, color: "var(--text-3)", marginLeft: 2 }}>pts</span>
+                </div>
+              </div>
+            )}
+
+            {d.actual_gain != null && d.decision_followed === true && (
+              <div>
+                <div style={{
+                  fontFamily: "var(--font-ui)", fontSize: 8, color: "var(--text-3)",
+                  letterSpacing: "0.1em", textTransform: "uppercase", marginBottom: 3,
+                }}>
+                  {actualLabel}
+                </div>
+                <div style={{
+                  fontFamily: "var(--font-data)", fontSize: 22, fontWeight: 700,
+                  letterSpacing: "-0.04em",
+                  color: verdict
+                    ? verdict.color
+                    : d.actual_gain >= 0
+                    ? "var(--green)"
+                    : "var(--red)",
+                }}>
+                  {d.actual_gain >= 0 ? "+" : ""}{d.actual_gain.toFixed(1)}
+                  <span style={{ fontFamily: "var(--font-ui)", fontSize: 10, color: "var(--text-3)", marginLeft: 2 }}>pts</span>
+                </div>
+              </div>
+            )}
+
+            {d.actual_gain != null && d.decision_followed === false && (
+              <div>
+                <div style={{
+                  fontFamily: "var(--font-ui)", fontSize: 8, color: "var(--text-3)",
+                  letterSpacing: "0.1em", textTransform: "uppercase", marginBottom: 3,
+                }}>
+                  would have gained
+                </div>
+                <div style={{
+                  fontFamily: "var(--font-data)", fontSize: 22, fontWeight: 700,
+                  color: "var(--text-3)", letterSpacing: "-0.04em", opacity: 0.65,
+                }}>
+                  {d.actual_gain >= 0 ? "+" : ""}{d.actual_gain.toFixed(1)}
+                  <span style={{ fontFamily: "var(--font-ui)", fontSize: 10, color: "var(--text-3)", marginLeft: 2 }}>pts</span>
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Accuracy verdict box — only when prediction + actual both available */}
+        {verdict && (
+          <div style={{
+            background: `${verdict.color}0d`,
+            border: `1px solid ${verdict.color}2a`,
+            borderRadius: 8,
+            padding: "8px 10px",
+          }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 3 }}>
+              <span style={{
+                fontFamily: "var(--font-ui)", fontSize: 9, fontWeight: 700,
+                color: verdict.color, letterSpacing: "0.1em",
+              }}>
+                {verdict.label}
+              </span>
+              <span style={{ fontFamily: "var(--font-ui)", fontSize: 9, color: "var(--text-3)" }}>
+                {Math.abs(verdict.errorPts).toFixed(1)} pts off · {verdict.errorPct.toFixed(0)}% error
+              </span>
+            </div>
+            <div style={{
+              fontFamily: "var(--font-ui)", fontSize: 10, color: "var(--text-3)", lineHeight: 1.55,
+            }}>
+              {verdict.modelLearn}
+            </div>
+          </div>
+        )}
+
+        {/* Ignored with known prediction — show missed opportunity */}
+        {d.decision_followed === false && showPredicted && d.actual_gain == null && (
+          <div style={{
+            fontFamily: "var(--font-ui)", fontSize: 10, color: "var(--text-3)",
+            lineHeight: 1.55, marginTop: 2,
+          }}>
+            Not followed before deadline. Engine had predicted +{d.expected_points!.toFixed(1)} pts gain.
+          </div>
+        )}
+
+        {/* Chip followed, no expected pts — show resolved status or pending */}
+        {isChip && d.decision_followed === true && !showPredicted && d.actual_gain == null && (
+          <div style={{ fontFamily: "var(--font-ui)", fontSize: 10, color: "var(--text-3)", lineHeight: 1.55 }}>
+            {d.actual_points != null
+              ? `Chip played in GW${d.gameweek_id}. GW resolved.`
+              : `Chip played in GW${d.gameweek_id}. Awaiting GW resolution.`}
+          </div>
+        )}
+
+        {/* Followed, has a prediction, but GW not yet resolved (no team score yet) */}
+        {!isChip && d.decision_followed === true && showPredicted && d.actual_points == null && (
+          <div style={{
+            marginTop: 2,
+            display: "flex", alignItems: "center", gap: 5,
+            fontFamily: "var(--font-ui)", fontSize: 10, color: "var(--amber)",
+            lineHeight: 1.55,
+          }}>
+            <Clock size={10} />
+            GW{d.gameweek_id} in progress — awaiting final score.
+          </div>
+        )}
+
+        {/* Followed, GW resolved, but no individual gain tracked (transfers) */}
+        {!isChip && d.decision_followed === true && showPredicted && d.actual_points != null && d.actual_gain == null && (
+          <div style={{
+            marginTop: 2,
+            fontFamily: "var(--font-ui)", fontSize: 10, color: "var(--text-3)",
+            lineHeight: 1.55,
+          }}>
+            Transfer outcome — individual gain not separately tracked.
+          </div>
+        )}
+
+        {/* TC chip: explain predicted vs actual discrepancy */}
+        {isChip && d.decision_followed === true && showPredicted && d.actual_gain != null && (
+          <div style={{
+            marginTop: 2, fontFamily: "var(--font-ui)", fontSize: 10,
+            color: "var(--text-3)", lineHeight: 1.55,
+          }}>
+            Predicted: total captain score ×3 = {d.expected_points!.toFixed(1)} pts.
+            {" "}Actual bonus gained over regular captaincy: {d.actual_gain.toFixed(1)} pts.
+          </div>
+        )}
+      </div>
+    </motion.div>
+  );
+}
+
+// ── Season view ───────────────────────────────────────────────────────────────
+
 function SeasonView({ review }: { review: SeasonReview | null }) {
   if (!review || review.total_decisions === 0) return (
     <div style={{ textAlign: "center", padding: 40, color: "var(--text-3)", fontFamily: "var(--font-ui)", fontSize: 13, lineHeight: 1.6 }}>
       {review?.message || "No decisions logged yet. Sync your squad and make transfers to start tracking."}
     </div>
   );
+
   // Decisions logged but GW not resolved yet
   if ((review as any).analysis_mode === "pending") return (
     <div style={{ padding: "32px 16px", fontFamily: "var(--font-ui)", fontSize: 13, lineHeight: 1.7 }}>
@@ -1066,8 +1451,14 @@ function SeasonView({ review }: { review: SeasonReview | null }) {
     </div>
   );
 
+  // Sort individual decisions newest-first (by GW descending, then created_at descending)
+  const auditDecisions = [...(review.decisions || [])].sort(
+    (a, b) => (b.gameweek_id - a.gameweek_id) || ((b.created_at || "") > (a.created_at || "") ? 1 : -1)
+  );
+
   return (
     <>
+      {/* ── Season summary stats ─────────────────────────────────────────────── */}
       <motion.div
         initial={{ opacity: 0, y: 8 }}
         animate={{ opacity: 1, y: 0 }}
@@ -1075,64 +1466,103 @@ function SeasonView({ review }: { review: SeasonReview | null }) {
         style={{ padding: 16, borderRadius: 12, marginBottom: 16 }}
       >
         <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
-          <div style={{ fontFamily: "var(--font-ui)", fontSize: 11, color: "var(--text-3)", letterSpacing: "0.08em", textTransform: "uppercase" }}>
-            Season overview
+          <div style={{ fontFamily: "var(--font-ui)", fontSize: 11, fontWeight: 600, color: "var(--text-3)", letterSpacing: "0.08em", textTransform: "uppercase" }}>
+            Season Overview
           </div>
           {(review as any).pending_decisions > 0 && (
             <span style={{ fontFamily: "var(--font-ui)", fontSize: 9, fontWeight: 600, color: "var(--amber)", background: "rgba(245,158,11,0.1)", border: "1px solid rgba(245,158,11,0.2)", borderRadius: 20, padding: "2px 8px", letterSpacing: "0.06em" }}>
-              {(review as any).pending_decisions} pending
+              {(review as any).pending_decisions} actionable
             </span>
           )}
         </div>
-        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 14 }}>
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginBottom: 10 }}>
           {[
-            { label: "total decisions", value: review.total_decisions },
-            { label: "adherence", value: `${((review.adherence_rate || 0) * 100).toFixed(0)}%` },
-            { label: "net pts vs rec", value: review.net_pts_vs_ai != null ? `${review.net_pts_vs_ai >= 0 ? "+" : ""}${review.net_pts_vs_ai.toFixed(1)}` : "—", color: (review.net_pts_vs_ai || 0) >= 0 ? "var(--green)" : "var(--red)" },
-            { label: "rank gain", value: review.total_rank_gain_following_ai?.toLocaleString() || "—" },
+            { label: "decisions tracked", value: String(review.total_decisions), color: undefined as string | undefined },
+            { label: "followed / ignored", value: `${review.followed ?? 0} / ${review.ignored ?? 0}`, color: undefined },
+            {
+              label: "adherence rate",
+              value: `${((review.adherence_rate || 0) * 100).toFixed(0)}%`,
+              color: (review.adherence_rate || 0) >= 0.7
+                ? "var(--green)"
+                : (review.adherence_rate || 0) >= 0.4
+                ? "var(--amber)"
+                : "var(--red)",
+            },
+            {
+              label: "vs GW average",
+              value: review.net_pts_vs_ai != null
+                ? `${review.net_pts_vs_ai >= 0 ? "+" : ""}${review.net_pts_vs_ai.toFixed(1)}`
+                : "—",
+              color: (review.net_pts_vs_ai || 0) >= 0 ? "var(--green)" : "var(--red)",
+            },
           ].map(({ label, value, color }) => (
             <div key={label} style={{ padding: "10px 12px", background: "var(--surface)", borderRadius: 8, border: "1px solid var(--divider)" }}>
-              <div style={{ fontFamily: "var(--font-data)", fontSize: 20, fontWeight: 700, color: (color as string | undefined) || "var(--text-1)" }}>{value}</div>
+              <div style={{ fontFamily: "var(--font-data)", fontSize: 18, fontWeight: 700, color: color || "var(--text-1)", letterSpacing: "-0.02em" }}>{value}</div>
               <div style={{ fontFamily: "var(--font-ui)", fontSize: 9, color: "var(--text-3)", textTransform: "uppercase", letterSpacing: "0.06em", marginTop: 2 }}>{label}</div>
             </div>
           ))}
         </div>
+        {(review as any).resolved_gw_count != null && (
+          <div style={{ fontFamily: "var(--font-ui)", fontSize: 10, color: "var(--text-3)", lineHeight: 1.5 }}>
+            {(review as any).resolved_gw_count === 0
+              ? "No resolved GWs yet — stats appear once a GW settles."
+              : `Based on ${(review as any).resolved_gw_count} resolved GW${(review as any).resolved_gw_count !== 1 ? "s" : ""}. Ignored = recommended but deadline passed without action.`}
+          </div>
+        )}
       </motion.div>
 
-      {review.by_decision_type && Object.entries(review.by_decision_type).map(([dt, stats]) => (
-        <motion.div
-          key={dt}
-          initial={{ opacity: 0, y: 4 }}
-          animate={{ opacity: 1, y: 0 }}
-          style={{
-            padding: "12px 14px",
-            borderRadius: 10,
-            background: "var(--surface)",
-            border: "1px solid var(--divider)",
-            marginBottom: 8,
-          }}
-        >
-          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
-            <span style={{ fontFamily: "var(--font-ui)", fontSize: 12, fontWeight: 600, color: "var(--text-1)", textTransform: "capitalize" }}>
-              {dt}
-            </span>
-            <span style={{ fontFamily: "var(--font-data)", fontSize: 12, color: stats.adherence_rate > 0.6 ? "var(--green)" : "var(--amber)" }}>
-              {(stats.adherence_rate * 100).toFixed(0)}% followed
-            </span>
+      {/* ── Decision audit ───────────────────────────────────────────────────── */}
+      {auditDecisions.length > 0 && (
+        <>
+          <div style={{
+            fontFamily: "var(--font-ui)", fontSize: 9, fontWeight: 700,
+            color: "var(--text-3)", letterSpacing: "0.12em",
+            textTransform: "uppercase", marginBottom: 10,
+          }}>
+            Decision Audit
           </div>
-          <div style={{ display: "flex", gap: 16 }}>
-            {[
-              { label: "avg expected", value: stats.avg_expected.toFixed(1) },
-              { label: "avg actual", value: stats.avg_actual.toFixed(1), color: stats.avg_actual >= stats.avg_expected ? "var(--green)" : "var(--red)" },
-            ].map(({ label, value, color }) => (
-              <div key={label}>
-                <div style={{ fontFamily: "var(--font-data)", fontSize: 16, fontWeight: 600, color: (color as string | undefined) || "var(--text-2)" }}>{value}</div>
-                <div style={{ fontFamily: "var(--font-ui)", fontSize: 9, color: "var(--text-3)", textTransform: "uppercase", letterSpacing: "0.06em" }}>{label}</div>
+          {auditDecisions.map((d) => (
+            <DecisionAuditCard key={d.id} d={d} />
+          ))}
+        </>
+      )}
+
+      {/* Fallback: show aggregate by_decision_type if no individual rows returned */}
+      {auditDecisions.length === 0 && review.by_decision_type && (
+        Object.entries(review.by_decision_type).map(([dt, stats]) => (
+          <motion.div
+            key={dt}
+            initial={{ opacity: 0, y: 4 }}
+            animate={{ opacity: 1, y: 0 }}
+            style={{ padding: "12px 14px", borderRadius: 10, background: "var(--surface)", border: "1px solid var(--divider)", marginBottom: 8 }}
+          >
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
+              <span style={{ fontFamily: "var(--font-ui)", fontSize: 12, fontWeight: 600, color: "var(--text-1)", textTransform: "capitalize" }}>
+                {dt.replace(/_/g, " ")}
+              </span>
+              <span style={{ fontFamily: "var(--font-data)", fontSize: 12, color: stats.adherence_rate > 0.6 ? "var(--green)" : stats.adherence_rate > 0 ? "var(--amber)" : "var(--red)" }}>
+                {stats.followed}✓ {stats.ignored}✗
+              </span>
+            </div>
+            <div style={{ display: "flex", gap: 16 }}>
+              <div>
+                <div style={{ fontFamily: "var(--font-data)", fontSize: 16, fontWeight: 600, color: "var(--text-2)" }}>{stats.avg_expected.toFixed(1)}</div>
+                <div style={{ fontFamily: "var(--font-ui)", fontSize: 9, color: "var(--text-3)", textTransform: "uppercase", letterSpacing: "0.06em" }}>model predicted</div>
               </div>
-            ))}
-          </div>
-        </motion.div>
-      ))}
+              {stats.avg_actual_gain != null && (
+                <div>
+                  <div style={{ fontFamily: "var(--font-data)", fontSize: 16, fontWeight: 700, color: stats.avg_actual_gain >= 0 ? "var(--green)" : "var(--red)" }}>
+                    {stats.avg_actual_gain >= 0 ? "+" : ""}{(stats.avg_actual_gain as number).toFixed(1)}
+                  </div>
+                  <div style={{ fontFamily: "var(--font-ui)", fontSize: 9, color: "var(--text-3)", textTransform: "uppercase", letterSpacing: "0.06em" }}>
+                    {dt.toLowerCase().includes("captain") ? "captain scored" : "actual gain"}
+                  </div>
+                </div>
+              )}
+            </div>
+          </motion.div>
+        ))
+      )}
     </>
   );
 }
@@ -1209,7 +1639,7 @@ function OracleFormationGrid({ squad, formation, captain, compact = false }: {
                 const isCaptain = name === captain;
                 const pInfo = playerByName[name];
                 return (
-                  <div key={pi} style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 3 }}>
+                  <div key={pi} title={name} style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 3, cursor: "default" }}>
                     {/* Player circle */}
                     <div style={{
                       width: circleSize, height: circleSize, borderRadius: "50%", position: "relative",
@@ -1300,44 +1730,13 @@ function OracleView({
             Best possible £100m squad at deadline vs your actual picks.
           </p>
         </div>
-        <div style={{ display: "flex", flexDirection: "column", gap: 8, alignItems: "flex-end" }}>
-          <motion.button
-            whileHover={{ scale: 1.01 }}
-            whileTap={{ scale: 0.98 }}
-            onClick={onSnapshot}
-            disabled={takingSnapshot || !teamId}
-            style={{
-              padding: "8px 16px", borderRadius: 10,
-              border: "1px solid rgba(245,158,11,0.35)",
-              background: takingSnapshot ? "rgba(255,255,255,0.03)" : "rgba(245,158,11,0.08)",
-              color: takingSnapshot ? "var(--text-3)" : "var(--amber)",
-              fontFamily: "var(--font-ui)", fontSize: 11, fontWeight: 600,
-              cursor: takingSnapshot ? "not-allowed" : "pointer",
-              whiteSpace: "nowrap" as const,
-              transition: "all 150ms",
-            }}
-          >
-            {takingSnapshot ? "Computing…" : "Snapshot Now"}
-          </motion.button>
-          {hasUnresolved && onAutoResolve && (
-            <motion.button
-              whileHover={{ scale: 1.01 }}
-              whileTap={{ scale: 0.98 }}
-              onClick={onAutoResolve}
-              disabled={autoResolving}
-              style={{
-                padding: "6px 14px", borderRadius: 8,
-                border: "1px solid rgba(34,197,94,0.3)",
-                background: autoResolving ? "rgba(255,255,255,0.02)" : "rgba(34,197,94,0.06)",
-                color: autoResolving ? "var(--text-3)" : "var(--green)",
-                fontFamily: "var(--font-ui)", fontSize: 10, fontWeight: 600,
-                cursor: autoResolving ? "not-allowed" : "pointer",
-                whiteSpace: "nowrap" as const,
-                transition: "all 150ms",
-              }}
-            >
-              {autoResolving ? "Resolving…" : "Fetch Actual Points"}
-            </motion.button>
+        {/* Auto-snapshot & auto-resolve status — no manual buttons needed */}
+        <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+          {(takingSnapshot || autoResolving) && (
+            <span style={{ fontFamily: "var(--font-ui)", fontSize: 10, color: "var(--text-3)", display: "flex", alignItems: "center", gap: 5 }}>
+              <motion.span animate={{ opacity: [0.4, 1, 0.4] }} transition={{ repeat: Infinity, duration: 1.4 }} style={{ display: "inline-block", width: 6, height: 6, borderRadius: "50%", background: "var(--green)" }} />
+              {takingSnapshot ? "Computing oracle…" : "Updating results…"}
+            </span>
           )}
         </div>
       </div>
@@ -1352,10 +1751,9 @@ function OracleView({
             borderRadius: 16,
           }}
         >
-          <div style={{ fontFamily: "var(--font-data)", fontSize: 44, marginBottom: 16, color: "var(--amber)", opacity: 0.25 }}>◈</div>
+          <motion.div style={{ width: 8, height: 8, borderRadius: "50%", background: "var(--amber)", margin: "0 auto 16px" }} animate={{ opacity: [0.3, 0.9, 0.3] }} transition={{ repeat: Infinity, duration: 1.8 }} />
           <p style={{ fontFamily: "var(--font-ui)", fontSize: 13, color: "var(--text-3)", lineHeight: 1.7, margin: 0 }}>
-            No oracle snapshots yet.<br />
-            <span style={{ color: "var(--amber)", fontWeight: 600 }}>Snapshot Now</span> to log the theoretically optimal team.
+            Computing oracle squad…
           </p>
         </motion.div>
       ) : (
@@ -1467,10 +1865,8 @@ function OracleView({
                         <>
                           <div style={{ display: "flex", alignItems: "baseline", justifyContent: "center", gap: 4 }}>
                             <div style={{ fontFamily: "var(--font-data)", fontSize: 22, fontWeight: 700, color: "var(--text-1)", lineHeight: 1 }}>
-                              {/* Show normalised score when chip stripped */}
-                              {s.top_team.chip && (s.top_team.chip_adjustment ?? 0) > 0
-                                ? (s.top_team.display_points ?? s.top_team.points_normalised ?? s.top_team.points ?? "Data unavailable")
-                                : (s.top_team.display_points ?? s.top_team.points ?? "Data unavailable")}
+                              {/* Always show the real FPL score — normalisation is only for Oracle comparison */}
+                              {s.top_team.points ?? "—"}
                             </div>
                             {/* Chip badge */}
                             {s.top_team.chip && (
@@ -1490,7 +1886,7 @@ function OracleView({
                             <>
                               <div style={{ fontFamily: "var(--font-data)", fontSize: 16, fontWeight: 600, color: "rgba(255,255,255,0.2)", lineHeight: 1.2 }}>—</div>
                               <div style={{ fontFamily: "var(--font-ui)", fontSize: 8, color: "rgba(255,255,255,0.25)", textTransform: "uppercase" as const, letterSpacing: "0.05em", marginTop: 5 }}>Data unavailable</div>
-                              <div style={{ fontFamily: "var(--font-ui)", fontSize: 8, color: "rgba(255,255,255,0.2)", marginTop: 2, lineHeight: 1.4 }}>Top team data is updated post-GW. Try auto-resolve.</div>
+                              <div style={{ fontFamily: "var(--font-ui)", fontSize: 8, color: "rgba(255,255,255,0.2)", marginTop: 2, lineHeight: 1.4 }}>Updates automatically after GW settles.</div>
                             </>
                           ) : (
                             /* GW not yet finished */
@@ -1522,176 +1918,164 @@ function OracleView({
                   </div>
                 )}
 
-                {/* ── Oracle vs #1 FPL Analysis (post-resolve) ── */}
-                {s.resolved && s.top_team && (
-                  <div style={{
-                    borderRadius: 10, overflow: "hidden",
-                    border: "1px solid var(--divider)",
-                    background: "var(--surface-2)",
-                  }}>
-                    {/* Section header */}
-                    <div style={{
-                      display: "flex", alignItems: "center", justifyContent: "space-between",
-                      padding: "9px 12px",
-                      borderBottom: "1px solid var(--divider)",
-                      background: "rgba(255,255,255,0.02)",
-                    }}>
-                      <span style={{ fontFamily: "var(--font-ui)", fontSize: 9, color: "var(--text-3)", letterSpacing: "0.08em", textTransform: "uppercase" }}>
-                        Oracle vs #1 FPL · GW{s.gameweek_id}
-                      </span>
-                      <span style={{
-                        fontFamily: "var(--font-ui)", fontSize: 9, fontWeight: 600, padding: "2px 8px", borderRadius: 4,
-                        background: s.top_team.status === "unavailable"
-                          ? "rgba(255,255,255,0.06)"
-                          : s.oracle_beat_top ? "rgba(34,197,94,0.12)" : "rgba(239,68,68,0.1)",
-                        color: s.top_team.status === "unavailable"
-                          ? "var(--text-3)"
-                          : s.oracle_beat_top ? "var(--green)" : "var(--red)",
-                        border: `1px solid ${s.top_team.status === "unavailable"
-                          ? "rgba(255,255,255,0.1)"
-                          : s.oracle_beat_top ? "rgba(34,197,94,0.25)" : "rgba(239,68,68,0.2)"}`,
-                      }}>
-                        {s.top_team.status === "unavailable" ? "Top team unavailable" : s.oracle_beat_top ? "Oracle won" : "Oracle lost"}
-                      </span>
-                    </div>
+                {/* ── Oracle vs GW average context ── */}
+                {s.resolved && s.actual_oracle_points != null && s.gw_average != null && (
+                  <div style={{ display: "flex", gap: 8, alignItems: "center", padding: "6px 10px", borderRadius: 7, background: "rgba(255,255,255,0.03)", border: "1px solid var(--divider)" }}>
+                    <span style={{ fontFamily: "var(--font-ui)", fontSize: 10, color: "var(--text-3)" }}>
+                      GW avg: <strong style={{ color: "var(--text-2)" }}>{s.gw_average}</strong>
+                    </span>
+                    <span style={{ fontFamily: "var(--font-ui)", fontSize: 10, color: "var(--text-3)", marginLeft: 4 }}>·</span>
+                    <span style={{ fontFamily: "var(--font-ui)", fontSize: 10, fontWeight: 600,
+                      color: (s.oracle_vs_avg ?? 0) >= 0 ? "var(--green)" : "var(--red)" }}>
+                      Oracle {(s.oracle_vs_avg ?? 0) >= 0 ? "+" : ""}{s.oracle_vs_avg?.toFixed(0)} vs avg
+                    </span>
+                    <span style={{ fontFamily: "var(--font-ui)", fontSize: 9, color: "var(--text-3)", marginLeft: "auto", lineHeight: 1.4 }}>
+                      Benchmark: best team (top 250 scan)
+                    </span>
+                  </div>
+                )}
 
-                    <div style={{ padding: "10px 12px", display: "flex", flexDirection: "column", gap: 7 }}>
-                      {s.top_team.status === "unavailable" && (
-                        <div style={{
-                          padding: "8px 10px", borderRadius: 8,
-                          background: "rgba(255,255,255,0.03)", border: "1px solid rgba(255,255,255,0.08)",
-                          fontFamily: "var(--font-ui)", fontSize: 10, color: "var(--text-2)", lineHeight: 1.5,
-                        }}>
-                          Data unavailable. The top GW team could not be resolved from FPL for this gameweek yet.
-                        </div>
-                      )}
-                      {/* Why Oracle was beaten — only shown when it lost */}
-                      {s.top_team.status !== "unavailable" && s.oracle_beat_top === false && (
-                        <div style={{
-                          padding: "8px 10px", borderRadius: 8,
-                          background: "rgba(239,68,68,0.06)", border: "1px solid rgba(239,68,68,0.18)",
-                        }}>
-                          <div style={{ fontFamily: "var(--font-ui)", fontSize: 8, color: "var(--red)", textTransform: "uppercase", letterSpacing: "0.08em", marginBottom: 5 }}>
-                            Why Oracle lost
-                          </div>
-                          <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-                            {/* Chip advantage */}
-                            {s.top_team.chip && (
-                              <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                                <span style={{ fontFamily: "var(--font-data)", fontSize: 9, fontWeight: 700, color: "var(--amber)", background: "rgba(245,158,11,0.12)", border: "1px solid rgba(245,158,11,0.3)", borderRadius: 3, padding: "1px 5px" }}>
-                                  {s.top_team.chip.replace("3xc","Triple Captain").replace("bboost","Bench Boost").replace("freehit","Free Hit").replace("wildcard","Wildcard")}
-                                </span>
-                                <span style={{ fontFamily: "var(--font-ui)", fontSize: 10, color: "var(--text-2)" }}>
-                                  {(s.top_team.chip_adjustment ?? 0) > 0
-                                    ? `chip gave +${s.top_team.chip_adjustment} pts advantage`
-                                    : "chip advantage — comparison normalised"}
-                                </span>
-                              </div>
-                            )}
-                            {/* Captain mismatch */}
-                            {s.top_team.captain && s.oracle_captain?.name && s.top_team.captain !== s.oracle_captain.name && (
-                              <div style={{ fontFamily: "var(--font-ui)", fontSize: 10, color: "var(--text-2)" }}>
-                                Their captain: <strong style={{ color: "var(--text-1)" }}>{s.top_team.captain}</strong> · Oracle captained <strong style={{ color: "var(--amber)" }}>{s.oracle_captain.name}</strong>
-                              </div>
-                            )}
-                            {/* Missed players */}
-                            {s.missed_players && s.missed_players.length > 0 && (
-                              <div style={{ fontFamily: "var(--font-ui)", fontSize: 10, color: "var(--text-2)" }}>
-                                Missed high-scorers:{" "}
-                                {s.missed_players.slice(0, 4).map((p, idx) => (
-                                  <span key={p}><strong style={{ color: "var(--red)" }}>{p}</strong>{idx < Math.min(3, s.missed_players.length - 1) ? ", " : ""}</span>
-                                ))}
-                                {s.missed_players.length > 4 && <span style={{ color: "var(--text-3)" }}> +{s.missed_players.length - 4} more</span>}
-                              </div>
-                            )}
-                            {/* Chip miss reason (engine learning) */}
-                            {s.top_team.chip_miss_reason && (
-                              <div style={{ fontFamily: "var(--font-ui)", fontSize: 9, color: "var(--amber)", opacity: 0.85, lineHeight: 1.4 }}>
-                                Engine note: {s.top_team.chip_miss_reason.slice(0, 120)}
-                              </div>
-                            )}
-                          </div>
-                        </div>
-                      )}
+                {/* ── Oracle vs #1 FPL Analysis (post-resolve) — plain English ── */}
+                {s.resolved && (() => {
+                  const tt = s.top_team;
+                  const noData = !tt || tt.status === "unavailable";
+                  const oraclePts = s.actual_oracle_points ?? 0;
+                  // Always use normalised pts for the fair comparison (chip stripped)
+                  const topFairPts = tt?.points_normalised ?? tt?.points ?? 0;
+                  const topRawPts = tt?.points ?? 0;
+                  const chipAdj = tt?.chip_adjustment ?? 0;
+                  const chip = tt?.chip;
+                  const CHIP_NAMES: Record<string, string> = { bboost: "Bench Boost", "3xc": "Triple Captain", freehit: "Free Hit", wildcard: "Wildcard" };
+                  const chipName = chip ? (CHIP_NAMES[chip] ?? chip) : null;
+                  const gap = topFairPts - oraclePts; // positive = oracle lost by this much
+                  const oracleLost = s.oracle_beat_top === false;
+                  const captainMatch = tt?.captain && s.oracle_captain?.name && tt.captain === s.oracle_captain.name;
+                  const captainMismatch = tt?.captain && s.oracle_captain?.name && tt.captain !== s.oracle_captain.name;
 
-                      {/* Captain row */}
-                      {s.top_team.status !== "unavailable" && s.top_team.captain && (
-                        <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                          <span style={{ fontFamily: "var(--font-ui)", fontSize: 8, color: "var(--text-3)", textTransform: "uppercase", letterSpacing: "0.06em", minWidth: 50 }}>Captain</span>
-                          <span style={{ fontFamily: "var(--font-ui)", fontSize: 11, color: "var(--text-2)", fontWeight: 600 }}>{s.top_team.captain}</span>
-                        </div>
-                      )}
-
-                      {/* Chip strip note */}
-                      {s.top_team.status !== "unavailable" && s.top_team.chip && (s.top_team.chip_adjustment ?? 0) > 0 && (
-                        <div style={{ display: "flex", alignItems: "center", gap: 6, fontFamily: "var(--font-ui)", fontSize: 9, color: "var(--text-3)" }}>
-                          <span style={{ fontFamily: "var(--font-ui)", fontSize: 8, fontWeight: 600, color: "var(--amber)", textTransform: "uppercase", letterSpacing: "0.08em" }}>{s.top_team.chip.replace("3xc","TC").replace("bboost","BB")}</span>
-                          <span>Raw: {s.top_team.points} pts, normalised: {s.top_team.points_normalised}</span>
-                        </div>
-                      )}
-                    </div>
-
-                    {/* Engine learning — always shown post-resolve */}
-                    {s.resolved && (
-                      <div style={{
-                        borderTop: "1px solid var(--divider)",
-                        padding: "8px 12px",
-                        background: "rgba(255,255,255,0.01)",
-                      }}>
-                        <div style={{ fontFamily: "var(--font-ui)", fontSize: 9, color: "var(--text-3)", textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 5 }}>
-                          What the engine learned
-                        </div>
-                        {s.blind_spots?.insight ? (
-                          <div style={{ fontFamily: "var(--font-ui)", fontSize: 10, color: "var(--text-2)", lineHeight: 1.5 }}>
-                            {s.blind_spots.insight}
-                          </div>
-                        ) : s.missed_players && s.missed_players.length > 0 ? (
-                          <div style={{ fontFamily: "var(--font-ui)", fontSize: 10, color: "var(--text-3)", lineHeight: 1.5 }}>
-                            Blind spot: Oracle didn&apos;t pick {s.missed_players.slice(0, 3).join(", ")}{s.missed_players.length > 3 ? ` and ${s.missed_players.length - 3} others` : ""} who scored highly for #1 FPL. Form weighting for these positions adjusted.
-                          </div>
-                        ) : (() => {
-                          const oraclePts = s.actual_oracle_points;
-                          const topPts = s.top_team?.points;
-                          const chip = s.top_team?.chip;
-                          const chipLabel = chip ? chip.replace("3xc","Triple Captain").replace("bboost","Bench Boost").replace("freehit","Free Hit").replace("wildcard","Wildcard") : null;
-                          const gap = oraclePts != null && topPts != null ? Math.abs(topPts - oraclePts) : null;
-                          const oracleLost = oraclePts != null && topPts != null ? oraclePts < topPts : true;
-                          return (
-                            <div style={{ fontFamily: "var(--font-ui)", fontSize: 10, color: "var(--text-3)", lineHeight: 1.5 }}>
-                              {oracleLost
-                                ? <>Oracle scored {oraclePts ?? "—"} pts vs #1 FPL&apos;s {topPts ?? "—"} pts{chipLabel ? ` (they used ${chipLabel})` : ""}. {gap != null ? `${gap}-pt gap` : "Gap"} recorded — model bias adjustment queued for next run.</>
-                                : <>Oracle scored {oraclePts ?? "—"} pts vs #1 FPL&apos;s {topPts ?? "—"} pts{chipLabel ? ` (they used ${chipLabel})` : ""}. Oracle beat the top team — prediction residuals within target range.</>
-                              }
-                            </div>
-                          );
-                        })()}
-                        {/* Show pts gap data if available */}
-                        {(s.blind_spots?.top_pts != null || s.blind_spots?.oracle_pts != null) && (
-                          <div style={{ display: "flex", gap: 10, marginTop: 6 }}>
-                            {s.blind_spots.oracle_pts != null && (
-                              <div>
-                                <div style={{ fontFamily: "var(--font-data)", fontSize: 12, fontWeight: 700, color: "var(--amber)" }}>{s.blind_spots.oracle_pts}</div>
-                                <div style={{ fontFamily: "var(--font-ui)", fontSize: 8, color: "var(--text-3)", textTransform: "uppercase" }}>oracle</div>
-                              </div>
-                            )}
-                            {s.blind_spots.top_pts != null && (
-                              <div>
-                                <div style={{ fontFamily: "var(--font-data)", fontSize: 12, fontWeight: 700, color: "var(--text-1)" }}>{s.blind_spots.top_pts}</div>
-                                <div style={{ fontFamily: "var(--font-ui)", fontSize: 8, color: "var(--text-3)", textTransform: "uppercase" }}>#1 FPL</div>
-                              </div>
-                            )}
-                            {s.blind_spots.gap != null && (
-                              <div>
-                                <div style={{ fontFamily: "var(--font-data)", fontSize: 12, fontWeight: 700, color: "var(--red)" }}>-{s.blind_spots.gap}</div>
-                                <div style={{ fontFamily: "var(--font-ui)", fontSize: 8, color: "var(--text-3)", textTransform: "uppercase" }}>gap</div>
-                              </div>
+                  return (
+                    <div style={{ borderRadius: 10, overflow: "hidden", border: `1px solid ${oracleLost ? "rgba(239,68,68,0.2)" : noData ? "var(--divider)" : "rgba(34,197,94,0.2)"}`, background: "var(--surface-2)" }}>
+                      {/* Header */}
+                      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "10px 14px", borderBottom: "1px solid var(--divider)", background: "rgba(255,255,255,0.02)" }}>
+                        <span style={{ fontFamily: "var(--font-ui)", fontSize: 11, fontWeight: 600, color: "var(--text-2)" }}>
+                          GW{s.gameweek_id} · Oracle vs best FPL team
+                        </span>
+                        {!noData && (
+                          <div style={{ display: "flex", alignItems: "baseline", gap: 6 }}>
+                            <span style={{ fontFamily: "var(--font-data)", fontSize: 18, fontWeight: 700, color: "var(--amber)" }}>{oraclePts}</span>
+                            <span style={{ fontFamily: "var(--font-ui)", fontSize: 9, color: "var(--text-3)" }}>vs</span>
+                            <span style={{ fontFamily: "var(--font-data)", fontSize: 18, fontWeight: 700, color: oracleLost ? "var(--red)" : "var(--green)" }}>{topFairPts}</span>
+                            {oracleLost && gap > 0 && (
+                              <span style={{ fontFamily: "var(--font-ui)", fontSize: 9, fontWeight: 600, color: "var(--red)", background: "rgba(239,68,68,0.1)", border: "1px solid rgba(239,68,68,0.2)", borderRadius: 4, padding: "1px 5px" }}>
+                                −{gap} pts
+                              </span>
                             )}
                           </div>
                         )}
                       </div>
-                    )}
-                  </div>
-                )}
+
+                      <div style={{ padding: "12px 14px", display: "flex", flexDirection: "column", gap: 10 }}>
+                        {noData ? (
+                          <p style={{ fontFamily: "var(--font-ui)", fontSize: 11, color: "var(--text-3)", margin: 0 }}>
+                            Top team data updates automatically after each GW settles.
+                          </p>
+                        ) : (
+                          <>
+                            {/* ── Chip explanation ── */}
+                            {chipName && chipAdj > 0 && (
+                              <div style={{ padding: "10px 12px", borderRadius: 8, background: "rgba(245,158,11,0.06)", border: "1px solid rgba(245,158,11,0.2)" }}>
+                                <div style={{ fontFamily: "var(--font-ui)", fontSize: 11, fontWeight: 600, color: "var(--amber)", marginBottom: 4 }}>
+                                  The best team used {chipName}
+                                </div>
+                                <div style={{ fontFamily: "var(--font-ui)", fontSize: 11, color: "var(--text-2)", lineHeight: 1.6 }}>
+                                  {chip === "bboost"
+                                    ? `Their bench players scored ${chipAdj} extra points thanks to the Bench Boost chip. Oracle doesn't use chips, so to compare fairly we remove those ${chipAdj} points. Their real score was ${topRawPts} — we compare against ${topFairPts} (without bench boost).`
+                                    : chip === "3xc"
+                                    ? `They used Triple Captain — their captain scored ${chipAdj} extra points. Oracle captains normally (2×), so to compare fairly we remove those ${chipAdj} points. Their real score was ${topRawPts} — we compare against ${topFairPts}.`
+                                    : `They used ${chipName} and gained ${chipAdj} extra points from it. We compare against ${topFairPts} (chip points removed for a fair comparison).`
+                                  }
+                                </div>
+                              </div>
+                            )}
+
+                            {/* ── Score comparison ── */}
+                            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+                              <div style={{ padding: "8px 10px", borderRadius: 8, background: "rgba(245,158,11,0.06)", border: "1px solid rgba(245,158,11,0.15)", textAlign: "center" }}>
+                                <div style={{ fontFamily: "var(--font-data)", fontSize: 22, fontWeight: 700, color: "var(--amber)" }}>{oraclePts}</div>
+                                <div style={{ fontFamily: "var(--font-ui)", fontSize: 9, color: "var(--text-3)", textTransform: "uppercase", letterSpacing: "0.06em", marginTop: 2 }}>Oracle scored</div>
+                              </div>
+                              <div style={{ padding: "8px 10px", borderRadius: 8, background: oracleLost ? "rgba(239,68,68,0.06)" : "rgba(34,197,94,0.06)", border: `1px solid ${oracleLost ? "rgba(239,68,68,0.15)" : "rgba(34,197,94,0.15)"}`, textAlign: "center" }}>
+                                <div style={{ fontFamily: "var(--font-data)", fontSize: 22, fontWeight: 700, color: oracleLost ? "var(--red)" : "var(--green)" }}>{topFairPts}</div>
+                                <div style={{ fontFamily: "var(--font-ui)", fontSize: 9, color: "var(--text-3)", textTransform: "uppercase", letterSpacing: "0.06em", marginTop: 2 }}>Best team{chipAdj > 0 ? " (no chip)" : ""}</div>
+                              </div>
+                            </div>
+
+                            {/* ── Captain ── */}
+                            <div style={{ display: "flex", gap: 8, alignItems: "flex-start", flexWrap: "wrap" as const }}>
+                              <div style={{ padding: "6px 10px", borderRadius: 7, background: "rgba(255,255,255,0.04)", border: "1px solid var(--divider)", flex: 1, minWidth: 100 }}>
+                                <div style={{ fontFamily: "var(--font-ui)", fontSize: 8, color: "var(--text-3)", textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 3 }}>Oracle captain</div>
+                                <div style={{ fontFamily: "var(--font-ui)", fontSize: 12, fontWeight: 600, color: "var(--amber)" }}>{s.oracle_captain?.name ?? "—"}</div>
+                              </div>
+                              <div style={{ padding: "6px 10px", borderRadius: 7, background: "rgba(255,255,255,0.04)", border: "1px solid var(--divider)", flex: 1, minWidth: 100 }}>
+                                <div style={{ fontFamily: "var(--font-ui)", fontSize: 8, color: "var(--text-3)", textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 3 }}>Best team captain</div>
+                                <div style={{ fontFamily: "var(--font-ui)", fontSize: 12, fontWeight: 600, color: captainMatch ? "var(--green)" : "var(--text-1)" }}>
+                                  {tt.captain ?? "—"} {captainMatch ? "✓" : ""}
+                                </div>
+                              </div>
+                            </div>
+
+                            {/* ── Why Oracle lost / What to improve ── */}
+                            {oracleLost ? (
+                              <div style={{ padding: "10px 12px", borderRadius: 8, background: "rgba(239,68,68,0.04)", border: "1px solid rgba(239,68,68,0.15)" }}>
+                                <div style={{ fontFamily: "var(--font-ui)", fontSize: 10, fontWeight: 600, color: "var(--red)", marginBottom: 6, textTransform: "uppercase" as const, letterSpacing: "0.06em" }}>
+                                  Why did Oracle score less?
+                                </div>
+                                <div style={{ fontFamily: "var(--font-ui)", fontSize: 11, color: "var(--text-2)", lineHeight: 1.7, display: "flex", flexDirection: "column" as const, gap: 4 }}>
+                                  {captainMismatch && (
+                                    <span>
+                                      <strong style={{ color: "var(--text-1)" }}>Captain call:</strong> Oracle picked <strong style={{ color: "var(--amber)" }}>{s.oracle_captain?.name}</strong> as captain but the best team had <strong style={{ color: "var(--text-1)" }}>{tt.captain}</strong>. Oracle chose based on expected points at deadline — {tt.captain} simply outperformed the model&apos;s prediction.
+                                    </span>
+                                  )}
+                                  {captainMatch && (
+                                    <span>
+                                      <strong style={{ color: "var(--green)" }}>Captain was right</strong> — both Oracle and the best team captained {tt.captain}. The gap came from player selection, not the captain pick.
+                                    </span>
+                                  )}
+                                  {s.missed_players && s.missed_players.length > 0 && (
+                                    <span>
+                                      <strong style={{ color: "var(--text-1)" }}>Players Oracle missed:</strong>{" "}
+                                      {s.missed_players.slice(0, 5).join(", ")}
+                                      {s.missed_players.length > 5 ? ` and ${s.missed_players.length - 5} more` : ""}. These players were in the best team but Oracle&apos;s model ranked others higher based on pre-GW expected points.
+                                    </span>
+                                  )}
+                                  {s.blind_spots?.insight && s.blind_spots.insight.includes("Self-improvement") && (
+                                    <span style={{ marginTop: 2, padding: "6px 8px", borderRadius: 6, background: "rgba(251,191,36,0.06)", border: "1px solid rgba(251,191,36,0.15)", display: "block", fontFamily: "var(--font-ui)", fontSize: 10, color: "var(--amber)", lineHeight: 1.6 }}>
+                                      <strong style={{ display: "block", marginBottom: 2 }}>Self-improvement applied this GW:</strong>
+                                      {s.blind_spots.insight.split("Self-improvement applied: ")[1]?.split(" · ")[0] ?? s.blind_spots.insight}
+                                    </span>
+                                  )}
+                                  {chipAdj > 0 && chipName && (
+                                    <span>
+                                      <strong style={{ color: "var(--amber)" }}>{chipName} chip:</strong> Even without the chip, the best team scored {topFairPts} — still {topFairPts - oraclePts} pts ahead of Oracle. The chip wasn&apos;t the only reason Oracle fell short.
+                                    </span>
+                                  )}
+                                </div>
+                              </div>
+                            ) : (
+                              <div style={{ padding: "10px 12px", borderRadius: 8, background: "rgba(34,197,94,0.04)", border: "1px solid rgba(34,197,94,0.15)" }}>
+                                <div style={{ fontFamily: "var(--font-ui)", fontSize: 11, color: "var(--green)", lineHeight: 1.7 }}>
+                                  <strong>Oracle matched the best team</strong> after removing the chip advantage. Oracle scored {oraclePts} vs their {topFairPts} (fair comparison). The model&apos;s predictions were on target this week.
+                                  {s.missed_players && s.missed_players.length > 0 && (
+                                    <> Players like {s.missed_players.slice(0, 3).join(", ")} were in the best team but not Oracle — Oracle still kept pace overall.</>
+                                  )}
+                                </div>
+                              </div>
+                            )}
+                          </>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })()}
 
                 {/* Formation view — full size for uniform UI/UX */}
                 {(s.oracle_squad_with_teams?.length > 0 || s.oracle_squad.length > 0) && (

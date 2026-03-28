@@ -77,6 +77,7 @@ interface SimResult {
   n_simulations: number;
   remaining_gws: number;
   current_gw: number;
+  league_avg_pts_so_far?: number;
   points_distribution: { p10: number; p25: number; p50: number; p75: number; p90: number; mean: number; std: number };
   rank_distribution: { p10: number; p25: number; p50: number; p75: number; p90: number };
   chip_timing_recommendation: string;
@@ -444,13 +445,18 @@ export default function LabPage() {
             {/* Rank + Risk + Chip */}
             <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
               <div style={{ background: "rgba(255,255,255,0.03)", border: "1px solid rgba(255,255,255,0.06)", borderRadius: 10, padding: "14px 16px" }}>
-                <p style={{ fontSize: 10, color: "rgba(255,255,255,0.35)", textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 8 }}>Estimated Rank (median)</p>
+                <p style={{ fontSize: 10, color: "rgba(255,255,255,0.35)", textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 8 }}>Projected Season Rank</p>
                 <p style={{ fontSize: 22, fontWeight: 700, color: GREEN, fontVariantNumeric: "tabular-nums" }}>
                   #{simResult.rank_distribution.p50.toLocaleString()}
                 </p>
                 <p style={{ fontSize: 10, color: "rgba(255,255,255,0.3)", marginTop: 4 }}>
                   Range: #{simResult.rank_distribution.p10.toLocaleString()} – #{simResult.rank_distribution.p90.toLocaleString()}
                 </p>
+                {simResult.league_avg_pts_so_far != null && (
+                  <p style={{ fontSize: 9, color: "rgba(255,255,255,0.2)", marginTop: 3 }}>
+                    Based on league avg {Math.round(simResult.league_avg_pts_so_far)} pts (GW1–{simResult.current_gw})
+                  </p>
+                )}
               </div>
               <div style={{ background: "rgba(255,255,255,0.03)", border: "1px solid rgba(255,255,255,0.06)", borderRadius: 10, padding: "14px 16px" }}>
                 <p style={{ fontSize: 10, color: "rgba(255,255,255,0.35)", textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 8 }}>Risk Profile</p>

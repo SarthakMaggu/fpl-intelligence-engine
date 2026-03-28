@@ -78,6 +78,16 @@ class DecisionLog(Base):
     inputs_used_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     simulation_summary_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
+    # Player ID tracking for decision-specific gain/loss computation
+    # captain: primary = captain player FPL ID
+    # transfer: primary = player_in FPL ID, secondary = player_out FPL ID
+    player_id_primary: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    player_id_secondary: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    # Actual gain/loss for this specific decision (not team total)
+    # captain: captain's total_points (the extra ×1 you gained by captaining)
+    # transfer: player_in.total_points - player_out.total_points
+    actual_gain: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     resolved_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
 

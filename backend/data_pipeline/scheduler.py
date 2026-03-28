@@ -1,14 +1,30 @@
 """
 APScheduler — defines all recurring jobs for the FPL Intelligence Engine.
 
-Jobs:
-- Daily 6:00 AM London: news scrape + price prediction check
-- Daily 8:00 AM London: ML model retrain
-- Tuesday 12:00 PM: full bootstrap pipeline (post-GW data complete)
-- Friday 10:00 AM: pre-GW email report (if email configured)
-- 6h before deadline: WhatsApp alert (if Twilio configured)
-- Dynamic: live polling job added when GW active, removed when finished
+Fixed schedule jobs (run regardless of GW timing):
+- Daily 6:00 AM London: news scrape
+- Daily 7:30 AM: enriched news + sentiment
+- Daily 8:00 AM: ML model refresh + MAE check
+- Daily 8:20 AM: feature drift monitor
+- Daily 2:00 AM: competition fixture sync
+- Daily 3:30 AM: anonymous data cleanup
+- Daily 13:05: Oracle snapshot
+- Tuesday 12:00 PM: FALLBACK full pipeline (catches any missed GW end)
+- Friday 10:00 AM: pre-GW email report
+- Every 4th Sunday 3:00 AM: historical model retrain
+
+Event-driven jobs (triggered by GW state watcher every 5 min):
+- GW finish detected → post-GW chain fires ~5min after data_checked=True:
+    T+5min:  full pipeline (bootstrap, fixtures, players, FDR, blank/double)
+    T+13min: ML model refresh + feature store update
+    T+23min: Oracle auto-resolve + online calibration
+    T+33min: weekly backtest
+    T+43min: MAE check → retrain if degraded
+- Deadline approaching (≤15min away) → pre-deadline squad sync:
+    Fetches all registered users' squads from FPL API (applying pending transfers)
+    so recommendations reflect the squad that will actually be submitted
 """
+import time as _time
 from datetime import datetime
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -17,9 +33,81 @@ import numpy as np
 
 scheduler = AsyncIOScheduler(timezone="Europe/London")
 
+
+async def _record_job_run(job_id: str, status: str, error: str | None, duration_s: float) -> None:
+    """Write job execution result to Redis so admin panel can display history.
+
+    Two stores per job:
+      1. Latest-run keys (fast lookup for the jobs list)
+      2. A rolling list of last 20 runs (for the run-history drawer)
+    """
+    import json as _json
+    try:
+        from core.redis_client import redis_client
+        now_iso = datetime.utcnow().isoformat()
+        ttl = 86400 * 30  # keep 30 days
+        await redis_client.set(f"job_history:{job_id}:last_run",        now_iso, ex=ttl)
+        await redis_client.set(f"job_history:{job_id}:last_status",     status,  ex=ttl)
+        await redis_client.set(f"job_history:{job_id}:last_duration_s", str(round(duration_s, 1)), ex=ttl)
+        if error:
+            await redis_client.set(f"job_history:{job_id}:last_error", error[:512], ex=ttl)
+        else:
+            await redis_client.delete(f"job_history:{job_id}:last_error")
+        # ── Rolling run-history list (last 20 runs, JSON entries) ──────────
+        entry = _json.dumps({
+            "ts": now_iso,
+            "status": status,
+            "duration_s": round(duration_s, 1),
+            "error": error[:256] if error else None,
+        })
+        list_key = f"job_history:{job_id}:runs"
+        await redis_client.lpush(list_key, entry)
+        await redis_client.ltrim(list_key, 0, 19)   # keep last 20 entries
+        await redis_client.expire(list_key, ttl)
+    except Exception as _e:
+        logger.warning(f"[job_history] Failed to record run for {job_id}: {_e}")
+
+
+def _tracked(job_id: str):
+    """
+    Decorator factory — wraps an async job function so execution metadata
+    (last_run, last_status, last_error, last_duration_s) is written to Redis
+    after every run. Used by all APScheduler job functions.
+    """
+    def decorator(fn):
+        async def wrapper(*args, **kwargs):
+            t0 = _time.monotonic()
+            try:
+                result = await fn(*args, **kwargs)
+                await _record_job_run(job_id, "success", None, _time.monotonic() - t0)
+                return result
+            except Exception as exc:
+                await _record_job_run(job_id, "failed", str(exc), _time.monotonic() - t0)
+                raise
+        wrapper.__name__ = fn.__name__
+        return wrapper
+    return decorator
+
 # Will be set during app startup
 _fetcher = None
 _notifier = None
+
+
+def _tj(job_id: str, fn):
+    """Wrap fn with job-history tracking for a given job_id."""
+    async def _wrapper(*args, **kwargs):
+        t0 = _time.monotonic()
+        try:
+            result = await fn(*args, **kwargs)
+            import asyncio
+            asyncio.create_task(_record_job_run(job_id, "success", None, _time.monotonic() - t0))
+            return result
+        except Exception as exc:
+            import asyncio
+            asyncio.create_task(_record_job_run(job_id, "failed", str(exc), _time.monotonic() - t0))
+            raise
+    _wrapper.__name__ = fn.__name__
+    return _wrapper
 
 
 def setup_scheduler(fetcher, notifier=None) -> None:
@@ -30,7 +118,7 @@ def setup_scheduler(fetcher, notifier=None) -> None:
 
     # Daily 6:00 AM — news scrape + price check
     scheduler.add_job(
-        _run_news_pipeline,
+        _tj("daily_news", _run_news_pipeline),
         CronTrigger(hour=6, minute=0),
         id="daily_news",
         replace_existing=True,
@@ -41,7 +129,7 @@ def setup_scheduler(fetcher, notifier=None) -> None:
 
     # Daily 8:00 AM — ML model retrain
     scheduler.add_job(
-        _run_model_refresh,
+        _tj("model_refresh", _run_model_refresh),
         CronTrigger(hour=8, minute=0),
         id="model_refresh",
         replace_existing=True,
@@ -52,7 +140,7 @@ def setup_scheduler(fetcher, notifier=None) -> None:
 
     # Tuesday 12:00 PM — full pipeline (post-Monday night fixtures)
     scheduler.add_job(
-        _run_full_pipeline,
+        _tj("weekly_full_pipeline", _run_full_pipeline),
         CronTrigger(day_of_week="tue", hour=12, minute=0),
         id="weekly_full_pipeline",
         replace_existing=True,
@@ -64,7 +152,7 @@ def setup_scheduler(fetcher, notifier=None) -> None:
     # Friday 10:00 AM — pre-GW email report
     if notifier and hasattr(notifier, "send_weekly_report"):
         scheduler.add_job(
-            _send_weekly_report,
+            _tj("weekly_email_report", _send_weekly_report),
             CronTrigger(day_of_week="fri", hour=10, minute=0),
             id="weekly_email_report",
             replace_existing=True,
@@ -72,11 +160,9 @@ def setup_scheduler(fetcher, notifier=None) -> None:
             max_instances=1,
         )
 
-    # Daily 13:00 — GW Oracle snapshot (catches most GW deadlines which are 11-18:30)
-    # Also runs Saturday/Sunday to cover weekend deadline weeks.
-    # The oracle endpoint is idempotent; if GW hasn't changed, it just updates the record.
+    # Daily 13:00 — GW Oracle snapshot
     scheduler.add_job(
-        _take_oracle_snapshot,
+        _tj("daily_oracle", _take_oracle_snapshot),
         CronTrigger(hour=13, minute=5),
         id="daily_oracle",
         replace_existing=True,
@@ -85,9 +171,9 @@ def setup_scheduler(fetcher, notifier=None) -> None:
         coalesce=True,
     )
 
-    # Daily 7:00 AM — news + sentiment refresh (richer sources)
+    # Daily 7:30 AM — news + sentiment refresh
     scheduler.add_job(
-        _run_enriched_news_pipeline,
+        _tj("enriched_news", _run_enriched_news_pipeline),
         CronTrigger(hour=7, minute=30),
         id="enriched_news",
         replace_existing=True,
@@ -97,9 +183,8 @@ def setup_scheduler(fetcher, notifier=None) -> None:
     )
 
     # Tuesday 14:00 — Oracle auto-resolve + top-team comparison + learning
-    # Runs after most post-GW data is settled on Tuesdays
     scheduler.add_job(
-        _run_oracle_auto_resolve_and_learn,
+        _tj("oracle_auto_resolve", _run_oracle_auto_resolve_and_learn),
         CronTrigger(day_of_week="tue", hour=14, minute=0),
         id="oracle_auto_resolve",
         replace_existing=True,
@@ -109,10 +194,9 @@ def setup_scheduler(fetcher, notifier=None) -> None:
     )
 
     # Monthly Sunday 3:00 AM — historical model retraining
-    # Pulls vaastav dataset + retrains LightGBM xPts model
     scheduler.add_job(
-        _run_historical_retrain,
-        CronTrigger(day_of_week="sun", hour=3, minute=0, week="*/4"),  # every 4th Sunday
+        _tj("historical_retrain", _run_historical_retrain),
+        CronTrigger(day_of_week="sun", hour=3, minute=0, week="*/4"),
         id="historical_retrain",
         replace_existing=True,
         name="Historical xPts Model Retrain",
@@ -120,10 +204,9 @@ def setup_scheduler(fetcher, notifier=None) -> None:
         coalesce=True,
     )
 
-    # Tuesday 15:00 — post-GW backtest (model + strategy, current season)
-    # Runs after oracle auto-resolve (14:00) so actual points are settled
+    # Tuesday 15:00 — post-GW backtest
     scheduler.add_job(
-        _run_weekly_backtest,
+        _tj("weekly_backtest", _run_weekly_backtest),
         CronTrigger(day_of_week="tue", hour=15, minute=0),
         id="weekly_backtest",
         replace_existing=True,
@@ -138,7 +221,7 @@ def setup_scheduler(fetcher, notifier=None) -> None:
 
     # Daily 3:30 AM — purge stale anonymous data (user_squads not linked to registered users)
     scheduler.add_job(
-        _run_anonymous_data_cleanup,
+        _tj("anon_cleanup", _run_anonymous_data_cleanup),
         CronTrigger(hour=3, minute=30),
         id="anon_cleanup",
         replace_existing=True,
@@ -148,7 +231,7 @@ def setup_scheduler(fetcher, notifier=None) -> None:
     )
 
     scheduler.add_job(
-        _run_feature_drift_monitor,
+        _tj("feature_drift_monitor", _run_feature_drift_monitor),
         CronTrigger(hour=8, minute=20),
         id="feature_drift_monitor",
         replace_existing=True,
@@ -160,11 +243,25 @@ def setup_scheduler(fetcher, notifier=None) -> None:
     # Daily 2:00 AM — sync competition fixtures (PL + UCL/FA Cup if API key set)
     # Low-priority background job; runs before model refresh at 8 AM
     scheduler.add_job(
-        _run_competition_fixture_sync,
+        _tj("competition_fixture_sync", _run_competition_fixture_sync),
         CronTrigger(hour=2, minute=0),
         id="competition_fixture_sync",
         replace_existing=True,
         name="Competition Fixture Sync (PL/UCL/FAC)",
+        max_instances=1,
+        coalesce=True,
+    )
+
+    # ── Every 5 min: GW state watcher (event-driven pipeline trigger) ──────────
+    # Detects GW finish → schedules post-GW chain
+    # Detects upcoming deadline (≤15 min) → triggers pre-deadline squad sync
+    scheduler.add_job(
+        _watch_gw_state,
+        "interval",
+        minutes=5,
+        id="gw_state_watcher",
+        replace_existing=True,
+        name="GW State Watcher",
         max_instances=1,
         coalesce=True,
     )
@@ -200,9 +297,10 @@ def remove_live_polling_job() -> None:
 
 async def _take_oracle_snapshot() -> None:
     """
-    Automatically snapshot the GW oracle for the default team_id.
+    Automatically snapshot the GW oracle for ALL registered users.
     Runs daily at 13:05 to catch most GW deadlines.
     The oracle route handles idempotency (updates existing record for same GW).
+    Also includes the admin FPL_TEAM_ID if set.
     """
     try:
         from core.config import settings
@@ -210,10 +308,7 @@ async def _take_oracle_snapshot() -> None:
         from api.routes.oracle import _compute_oracle
         from sqlalchemy import select
         from models.db.gameweek import Gameweek
-
-        team_id = settings.FPL_TEAM_ID
-        if not team_id:
-            return
+        from models.db.user_profile import UserProfile
 
         async with AsyncSessionLocal() as db:
             gw_res = await db.execute(select(Gameweek).where(Gameweek.is_current == True))
@@ -222,11 +317,30 @@ async def _take_oracle_snapshot() -> None:
                 logger.warning("Oracle snapshot: no current GW found")
                 return
 
-            record = await _compute_oracle(team_id, current_gw.id, db)
-            logger.info(
-                f"Oracle snapshot auto-taken: GW{current_gw.id} "
-                f"oracle_xpts={record.oracle_xpts} algo_xpts={record.algo_xpts}"
-            )
+            # Collect all team IDs: registered users + admin FPL_TEAM_ID
+            users_res = await db.execute(select(UserProfile.team_id))
+            team_ids: set[int] = {row[0] for row in users_res.fetchall()}
+            if settings.FPL_TEAM_ID:
+                team_ids.add(settings.FPL_TEAM_ID)
+
+            if not team_ids:
+                logger.info("Oracle snapshot: no registered users or FPL_TEAM_ID — skipping")
+                return
+
+            logger.info(f"Oracle snapshot: running for {len(team_ids)} teams (GW{current_gw.id})")
+            success = 0
+            for tid in team_ids:
+                try:
+                    record = await _compute_oracle(tid, current_gw.id, db)
+                    logger.debug(
+                        f"Oracle snapshot auto-taken: team={tid} GW{current_gw.id} "
+                        f"oracle_xpts={record.oracle_xpts} algo_xpts={record.algo_xpts}"
+                    )
+                    success += 1
+                except Exception as e:
+                    logger.warning(f"Oracle snapshot failed for team {tid}: {e}")
+
+            logger.info(f"Oracle snapshot complete: {success}/{len(team_ids)} teams OK")
     except Exception as e:
         logger.error(f"Oracle snapshot failed: {e}")
 
@@ -280,8 +394,13 @@ async def _update_feature_store() -> None:
             if not current_gw:
                 return
 
+            # Use gw_id+1 so that rolling stats include the completed current GW.
+            # build_features_for_gw uses WHERE gw_id < :gw_id, so passing current+1
+            # means "include GW{current} results" in the last-5-GW window.
+            # This ensures Bruno's GW31 haul is visible when predicting GW32.
+            predict_gw = current_gw.id + 1
             features = await build_features_for_gw(
-                gw_id=current_gw.id,
+                gw_id=predict_gw,
                 db=db,
                 redis=redis_client,
             )
@@ -290,7 +409,7 @@ async def _update_feature_store() -> None:
                 features=features,
                 db=db,
             )
-            logger.info(f"Feature store updated for GW{current_gw.id}: {len(features)} players")
+            logger.info(f"Feature store updated for GW{current_gw.id} (window up to GW{predict_gw-1}): {len(features)} players")
     except Exception as e:
         logger.warning(f"Feature store update failed: {e}")
 
@@ -532,23 +651,370 @@ async def _init_gw_news_window(gw_id: int) -> None:
         logger.error(f"_init_gw_news_window GW{gw_id} failed: {e}")
 
 
+async def _watch_gw_state() -> None:
+    """
+    Runs every 5 minutes.  Detects two events and fires the right jobs:
+
+    1. GW FINISH: current_gw.finished=True AND data_checked=True transitions to a
+       new GW id we haven't processed yet.  Schedules the post-GW pipeline chain
+       staggered over 45 minutes so FPL API data settles before each step.
+
+    2. DEADLINE APPROACHING: next (or current) GW deadline is ≤15 minutes away.
+       Triggers a one-shot pre-deadline squad sync so recommendations are based on
+       the squad the user will actually submit (including pending transfers).
+
+    Redis keys used:
+      gw_watcher:last_finished_gw  — id of the last GW we triggered post-GW for
+      gw_watcher:deadline_sync:{gw_id} — set when pre-deadline sync fires (24h TTL)
+    """
+    try:
+        from core.redis_client import redis_client
+        from core.database import AsyncSessionLocal
+        from models.db.gameweek import Gameweek
+        from sqlalchemy import select
+        from datetime import timezone, timedelta
+
+        async with AsyncSessionLocal() as db:
+            cur_res = await db.execute(select(Gameweek).where(Gameweek.is_current == True))
+            current_gw = cur_res.scalars().first()
+            nxt_res = await db.execute(select(Gameweek).where(Gameweek.is_next == True))
+            next_gw = nxt_res.scalars().first()
+
+        now = datetime.now(timezone.utc)
+
+        # ── Case 1: GW resolved — fire post-GW pipeline chain ────────────────
+        # Primary trigger: finished=True AND data_checked=True (FPL fully settled).
+        # Fallback trigger: gw_end_time + 24h elapsed regardless of FPL flags —
+        #   FPL sometimes delays data_checked for days; we can't wait forever.
+        # Either way we wait a minimum of 12h from gw_end_time so bonus points
+        # and player scores settle before recommendations are regenerated.
+        if current_gw:
+            gw_end = current_gw.gw_end_time
+            if gw_end and gw_end.tzinfo is None:
+                gw_end = gw_end.replace(tzinfo=timezone.utc)
+
+            twelve_hr_mark  = (gw_end + timedelta(hours=12))  if gw_end else None
+            twentyfour_mark = (gw_end + timedelta(hours=24))   if gw_end else None
+
+            # Condition A: FPL fully settled + 12h elapsed
+            fpl_ready = current_gw.finished and current_gw.data_checked and twelve_hr_mark and now >= twelve_hr_mark
+            # Condition B: 24h elapsed regardless of FPL flags (safety net)
+            timeout_ready = twentyfour_mark and now >= twentyfour_mark
+
+            if fpl_ready or timeout_ready:
+                # Idempotency: check whether the pipeline ACTUALLY RAN for this GW.
+                # We intentionally do NOT use a separate "last_finished_gw" lock because
+                # if the container restarts after the lock is set but before APScheduler
+                # jobs execute, the in-memory jobs are lost and the pipeline never runs.
+                # Instead we check the pipeline's own completion marker in Redis.
+                pipeline_ran_raw = await redis_client.get("pipeline:last_gw_run")
+                pipeline_ran_id  = int(pipeline_ran_raw) if pipeline_ran_raw else None
+
+                if pipeline_ran_id != current_gw.id:
+                    trigger = "FPL data_checked + 12h" if fpl_ready else "24h timeout (data_checked pending)"
+                    logger.info(
+                        f"[GW Watcher] GW{current_gw.id} — {trigger} — "
+                        f"pipeline not yet run for this GW — scheduling post-GW chain"
+                    )
+                    base = now + timedelta(minutes=1)   # start immediately
+                    _schedule_post_gw_chain(current_gw.id, base)
+                else:
+                    logger.debug(
+                        f"[GW Watcher] GW{current_gw.id} — post-GW pipeline already "
+                        f"ran (pipeline:last_gw_run={pipeline_ran_id}) — skipping"
+                    )
+            elif twelve_hr_mark and now < twelve_hr_mark:
+                mins_left = (twelve_hr_mark - now).total_seconds() / 60
+                logger.debug(
+                    f"[GW Watcher] GW{current_gw.id} 12h window not elapsed "
+                    f"({mins_left:.0f}min remaining)"
+                )
+
+        # ── Case 2: 1 hour before first kick-off ────────────────────────────
+        # In FPL the deadline is ~1hr before the first game, so this fires
+        # right around deadline time — squad is locked, all pending transfers
+        # are applied by FPL. We sync every user's squad and run cross-check.
+        target_gw = next_gw or current_gw
+        if target_gw and target_gw.gw_start_time:
+            kick_off = target_gw.gw_start_time
+            if kick_off.tzinfo is None:
+                kick_off = kick_off.replace(tzinfo=timezone.utc)
+
+            mins_to_kickoff = (kick_off - now).total_seconds() / 60.0
+
+            if 0 < mins_to_kickoff <= 65:  # window: 0–65 min before first game
+                lock_key = f"gw_watcher:pre_kickoff_sync:{target_gw.id}"
+                already_done = await redis_client.get(lock_key)
+                if not already_done:
+                    await redis_client.set(lock_key, "1", ex=86400)
+                    logger.info(
+                        f"[GW Watcher] GW{target_gw.id} kick-off in "
+                        f"{mins_to_kickoff:.0f}min — firing pre-kick-off squad sync + cross-check"
+                    )
+                    await _run_pre_deadline_squad_sync(target_gw.id)
+
+    except Exception as e:
+        logger.error(f"[GW Watcher] failed: {e}")
+
+
+def _schedule_post_gw_chain(gw_id: int, base_time: "datetime") -> None:
+    """
+    Register staggered one-shot APScheduler jobs for the post-GW pipeline.
+    Each step fires with a grace period so the previous one can finish and FPL
+    API data can settle.
+
+    Chain:
+      base + 0min  → full pipeline   (bootstrap, fixtures, players, FDR, blank/double)
+      base + 8min  → ML model refresh + feature store
+      base + 18min → Oracle auto-resolve + online calibration
+      base + 28min → weekly backtest (season accuracy)
+      base + 38min → MAE check → retrain if degraded
+    """
+    from datetime import timedelta
+
+    # ML predictions are already run inside _run_full_pipeline (step 8),
+    # so there is no separate "ML refresh" step here.
+    #
+    # Chain timeline (from base_time):
+    #   +0  min : full pipeline — fresh player data, fixtures, FDR, ML predictions
+    #   +15 min : squad sync (all users) — FH-aware, sets correct GW+1 planning squad
+    #   +20 min : Oracle resolve + calibration (mean residuals + isotonic calibrators)
+    #   +30 min : weekly backtest — season accuracy metrics
+    #   +35 min : MAE check → historical retrain if severely degraded (MAE > 2.5)
+    #   +45 min : incremental retrain from local DB + SHAP importance + calibrator refresh
+    # Total worst-case: ~55 min (60 min = safe buffer)
+    _ssid = f"post_gw_{gw_id}_squad_sync"
+    _retrain_id = f"post_gw_{gw_id}_retrain"
+    steps = [
+        (0,  f"post_gw_{gw_id}_pipeline",    f"GW{gw_id} Post-GW: Full Pipeline",                    _tj(f"post_gw_{gw_id}_pipeline",   _run_full_pipeline)),
+        (15, _ssid,                           f"GW{gw_id} Post-GW: Squad Sync (all users)",           _tj(_ssid,                         lambda: _run_post_gw_squad_sync(gw_id))),
+        (20, f"post_gw_{gw_id}_oracle",      f"GW{gw_id} Post-GW: Oracle Resolve + Calibration",     _tj(f"post_gw_{gw_id}_oracle",     _run_oracle_auto_resolve_and_learn)),
+        (30, f"post_gw_{gw_id}_backtest",    f"GW{gw_id} Post-GW: Backtest",                         _tj(f"post_gw_{gw_id}_backtest",   _run_weekly_backtest)),
+        (35, f"post_gw_{gw_id}_mae",         f"GW{gw_id} Post-GW: MAE/Retrain Check",                _tj(f"post_gw_{gw_id}_mae",        _check_mae_and_retrain)),
+        (45, _retrain_id,                    f"GW{gw_id} Post-GW: Incremental Retrain + SHAP",        _tj(_retrain_id,                   lambda: _run_post_gw_retrain(gw_id))),
+    ]
+
+    for offset_min, job_id, name, fn in steps:
+        fire_at = base_time + timedelta(minutes=offset_min)
+        scheduler.add_job(
+            fn,
+            "date",
+            run_date=fire_at,
+            id=job_id,
+            name=name,
+            replace_existing=True,
+            misfire_grace_time=3600,
+        )
+        logger.info(
+            f"[GW Watcher] Scheduled '{name}' at "
+            f"{fire_at.strftime('%Y-%m-%d %H:%M UTC')}"
+        )
+
+
+async def _run_pre_deadline_squad_sync(gw_id: int) -> None:
+    """
+    Fires 5–15 minutes before each GW deadline.
+
+    For every registered user, re-fetches their squad from FPL API including
+    any pending transfers made since the last GW ended.  This ensures the
+    strategy page recommendations are based on the squad they'll actually submit,
+    not last GW's squad.
+
+    Flow:
+      1. Fetch all registered user team_ids
+      2. For each: call fetcher.sync_squad_with_pending_transfers(team_id, gw_id)
+         which applies pending transfers from entry/{id}/transfers/ endpoint
+      3. Re-run ML predictions with fresh squad data so xPts reflect actual picks
+    """
+    try:
+        from core.database import AsyncSessionLocal
+        from models.db.user_profile import UserProfile
+        from sqlalchemy import select
+
+        async with AsyncSessionLocal() as db:
+            users_res = await db.execute(select(UserProfile.team_id))
+            team_ids = [row[0] for row in users_res.fetchall()]
+
+        if not team_ids:
+            logger.info(f"[Pre-deadline sync] GW{gw_id}: no registered users, skipping")
+            return
+
+        logger.info(
+            f"[Pre-deadline sync] GW{gw_id}: syncing {len(team_ids)} registered users"
+        )
+
+        if _fetcher:
+            for tid in team_ids:
+                try:
+                    await _fetcher.sync_squad_with_pending_transfers(tid, gw_id)
+                except Exception as e:
+                    logger.warning(
+                        f"[Pre-deadline sync] squad sync failed for team {tid}: {e}"
+                    )
+
+            # Refresh ML predictions after squad data is updated
+            try:
+                await _fetcher.run_ml_predictions()
+                logger.info(
+                    f"[Pre-deadline sync] GW{gw_id}: ML predictions refreshed "
+                    f"after squad sync"
+                )
+            except Exception as e:
+                logger.warning(f"[Pre-deadline sync] ML refresh failed: {e}")
+
+    except Exception as e:
+        logger.error(f"[Pre-deadline sync] GW{gw_id} failed: {e}")
+        await _send_admin_alert_safe(
+            f"Pre-Deadline Squad Sync Failed (GW{gw_id})",
+            f"_run_pre_deadline_squad_sync raised:\n\n{type(e).__name__}: {e}",
+        )
+
+
+async def _run_post_gw_squad_sync(gw_id: int) -> None:
+    """
+    Post-GW squad sync — fires after the full pipeline completes.
+
+    For every registered user, re-fetches their squad from FPL API using
+    sync_squad_with_pending_transfers which already contains Free Hit detection:
+    if the just-finished GW was a Free Hit, it fetches the pre-FH squad instead
+    so GW+1 recommendations are based on their real planning squad.
+
+    Runs BEFORE Oracle resolve so decision audit has the correct squad context.
+    """
+    next_gw_id = gw_id + 1
+    try:
+        from core.database import AsyncSessionLocal
+        from models.db.user_profile import UserProfile
+        from sqlalchemy import select
+
+        async with AsyncSessionLocal() as db:
+            users_res = await db.execute(select(UserProfile.team_id))
+            team_ids = [row[0] for row in users_res.fetchall()]
+
+        if not team_ids:
+            logger.info(f"[Post-GW squad sync] GW{gw_id}: no registered users")
+            return
+
+        logger.info(
+            f"[Post-GW squad sync] GW{gw_id}: syncing {len(team_ids)} users for GW{next_gw_id}"
+        )
+
+        if _fetcher:
+            for tid in team_ids:
+                try:
+                    await _fetcher.sync_squad_with_pending_transfers(tid, next_gw_id)
+                except Exception as e:
+                    logger.warning(
+                        f"[Post-GW squad sync] team {tid} failed (non-fatal): {e}"
+                    )
+
+    except Exception as e:
+        logger.error(f"[Post-GW squad sync] GW{gw_id} failed: {e}")
+        await _send_admin_alert_safe(
+            f"Post-GW Squad Sync Failed (GW{gw_id})",
+            f"_run_post_gw_squad_sync raised:\n\n{type(e).__name__}: {e}",
+        )
+
+
+async def _resolve_all_user_decisions() -> None:
+    """
+    After each GW settles: run resolve_gw_decisions for ALL registered users.
+
+    This ensures every user's decision_log rows get rewards computed and bandit
+    Q-values updated — not just the admin's FPL_TEAM_ID.
+
+    Queries the last finished GW (finished=True, data_checked=True) and iterates
+    all rows in user_profile.
+    """
+    try:
+        from core.database import AsyncSessionLocal
+        from models.db.gameweek import Gameweek
+        from models.db.user_profile import UserProfile
+        from rl.resolve_decisions import resolve_gw_decisions
+        from sqlalchemy import select
+
+        async with AsyncSessionLocal() as db:
+            # Find last settled GW
+            gw_res = await db.execute(
+                select(Gameweek)
+                .where(Gameweek.finished == True, Gameweek.data_checked == True)
+                .order_by(Gameweek.id.desc())
+            )
+            last_gw = gw_res.scalars().first()
+            if not last_gw:
+                logger.info("[resolve_all_users] No settled GW found — skipping")
+                return
+
+            # All registered users
+            users_res = await db.execute(select(UserProfile.team_id))
+            team_ids = [row[0] for row in users_res.fetchall()]
+
+        if not team_ids:
+            logger.info("[resolve_all_users] No registered users — skipping")
+            return
+
+        logger.info(
+            f"[resolve_all_users] Resolving GW{last_gw.id} decisions "
+            f"for {len(team_ids)} registered users"
+        )
+        failed = 0
+        for tid in team_ids:
+            try:
+                async with AsyncSessionLocal() as db:
+                    await resolve_gw_decisions(
+                        team_id=tid,
+                        gw_id=last_gw.id,
+                        db=db,
+                    )
+            except Exception as e:
+                logger.warning(f"[resolve_all_users] team {tid} failed: {e}")
+                failed += 1
+
+        logger.info(
+            f"[resolve_all_users] Done. "
+            f"{len(team_ids) - failed}/{len(team_ids)} users resolved."
+        )
+    except Exception as e:
+        logger.error(f"[resolve_all_users] Unexpected error: {e}")
+        await _send_admin_alert_safe(
+            "Decision Resolve (All Users) Failed",
+            f"_resolve_all_user_decisions raised:\n\n{type(e).__name__}: {e}",
+        )
+
+
 async def _run_oracle_auto_resolve_and_learn() -> None:
     """
     After each GW: auto-resolve oracle snapshots + fetch top team + run ML learner.
     Also runs online calibration to correct per-position/price-band prediction residuals.
     Runs Tuesdays at 14:00 (after Monday night fixtures settle).
+    Resolves oracle for ALL registered users (not just FPL_TEAM_ID).
     """
     try:
         from core.config import settings
+        from core.database import AsyncSessionLocal
+        from models.db.user_profile import UserProfile
         from services.job_queue import enqueue_job
+        from sqlalchemy import select
 
-        team_id = settings.FPL_TEAM_ID
-        if not team_id:
-            logger.warning("oracle_auto_resolve: no FPL_TEAM_ID configured")
-            return
+        # Collect all team IDs: registered users + admin FPL_TEAM_ID
+        async with AsyncSessionLocal() as db:
+            users_res = await db.execute(select(UserProfile.team_id))
+            team_ids: set[int] = {row[0] for row in users_res.fetchall()}
+        if settings.FPL_TEAM_ID:
+            team_ids.add(settings.FPL_TEAM_ID)
 
-        await enqueue_job(job_type="oracle.auto_resolve", payload={"team_id": team_id})
-        logger.info("Oracle auto-resolve job queued")
+        if not team_ids:
+            logger.warning("oracle_auto_resolve: no registered users or FPL_TEAM_ID — skipping")
+        else:
+            logger.info(f"Oracle auto-resolve: enqueueing for {len(team_ids)} teams")
+            for tid in team_ids:
+                try:
+                    await enqueue_job(job_type="oracle.auto_resolve", payload={"team_id": tid})
+                except Exception as e:
+                    logger.warning(f"oracle_auto_resolve: enqueue failed for team {tid}: {e}")
+
+        # ── Resolve decisions + bandit for ALL registered users ───────────────
+        await _resolve_all_user_decisions()
 
         # ── Online calibration post GW-resolve ────────────────────────────────
         await _run_online_calibration()
@@ -563,78 +1029,168 @@ async def _run_oracle_auto_resolve_and_learn() -> None:
 
 async def _run_online_calibration() -> None:
     """
-    Compute per-(position, price_band) mean residuals from last 5 GWs and
-    upsert into prediction_calibration table.
-    Called after Oracle auto-resolve so actual points are available.
+    Compute per-(position, price_band) mean residuals from last 10 GWs and
+    write to Redis ml:calibration_map + prediction_calibration table.
+
+    Data source: player_features_history × player_gw_history.
+    The features table stores predicted_xpts_next at gw_id=N (prediction for N+1).
+    The history table stores total_points at gw_id=N+1 (actual score for N+1).
+    Residual = actual(N+1) - predicted_next(from N).
+
+    This bypasses the predictions table which has a gw_id=0 data bug.
     """
     try:
         from core.database import AsyncSessionLocal
         from core.redis_client import redis_client
+        from models.db.feature_store import PlayerFeaturesHistory
         from models.db.history import PlayerGWHistory
-        from models.db.prediction import Prediction
-        from models.db.player import Player
         from sqlalchemy import select
         import orjson
+        import json as _json
+        from collections import defaultdict
 
         async with AsyncSessionLocal() as db:
-            # Get last 5 GW history rows with player position and actual points
-            history_res = await db.execute(
+            # ── Determine max GW with actual points data ──────────────────────
+            from sqlalchemy import func as _func
+            max_actual_res = await db.execute(select(_func.max(PlayerGWHistory.gw_id)))
+            max_actual_gw = max_actual_res.scalar() or 0
+            if max_actual_gw < 2:
+                logger.info("Online calibration: insufficient GW history data")
+                return
+
+            # ── Load feature history for GWs where actuals exist (gw N predicts N+1) ──
+            # Features at gw_id=N predict xPts for GW N+1, so we need gw_id <= max_actual_gw-1
+            feat_res = await db.execute(
+                select(
+                    PlayerFeaturesHistory.player_id,
+                    PlayerFeaturesHistory.gw_id,
+                    PlayerFeaturesHistory.features_json,
+                ).where(
+                    PlayerFeaturesHistory.gw_id <= max_actual_gw - 1
+                ).order_by(PlayerFeaturesHistory.gw_id.desc()).limit(15000)
+            )
+            feat_rows = feat_res.fetchall()
+            if not feat_rows:
+                logger.info("Online calibration: no feature history available yet")
+                return
+
+            # Build lookup: (player_id, gw_id) → (predicted_xpts_next, position, value)
+            pred_at_gw: dict[tuple, dict] = {}
+            for row in feat_rows:
+                fj = row.features_json
+                if isinstance(fj, str):
+                    try:
+                        fj = _json.loads(fj)
+                    except Exception:
+                        continue
+                pred_xpts = fj.get("predicted_xpts_next")
+                if pred_xpts is None or pred_xpts <= 0:
+                    continue
+                pred_at_gw[(row.player_id, row.gw_id)] = {
+                    "predicted": float(pred_xpts),
+                    "position": int(fj.get("position", 3)),
+                    "value": int(fj.get("value", 50)),  # pence × 10
+                }
+
+            # ── Load actual points (gw N+1) ──────────────────────────────────
+            if not pred_at_gw:
+                logger.info("Online calibration: no valid predictions in feature history")
+                return
+            min_gw = min(gw for (_, gw) in pred_at_gw)
+            max_gw = max(gw for (_, gw) in pred_at_gw)
+
+            hist_res = await db.execute(
                 select(
                     PlayerGWHistory.player_id,
                     PlayerGWHistory.gw_id,
                     PlayerGWHistory.total_points,
-                ).order_by(PlayerGWHistory.gw_id.desc()).limit(5000)
+                ).where(
+                    PlayerGWHistory.gw_id.between(min_gw + 1, max_gw + 1)
+                )
             )
-            history_rows = history_res.fetchall()
-
-            # Get predictions for those (player_id, gw_id) pairs
-            if not history_rows:
-                return
-
-            gw_ids = list({r.gw_id for r in history_rows})
-            pred_res = await db.execute(
-                select(Prediction).where(Prediction.gameweek_id.in_(gw_ids))
-            )
-            pred_rows = pred_res.scalars().all()
-            pred_map: dict[tuple, float] = {
-                (p.player_id, p.gameweek_id): (p.predicted_xpts or 0.0)
-                for p in pred_rows
+            actuals: dict[tuple, float] = {
+                (row.player_id, row.gw_id): float(row.total_points or 0)
+                for row in hist_res.fetchall()
             }
 
-            # Get player positions and prices
-            player_res = await db.execute(select(Player.id, Player.element_type, Player.now_cost))
-            player_info = {row[0]: (row[1], row[2]) for row in player_res.fetchall()}
+            # ── Compute residuals per (position, price_band) ─────────────────
+            residuals: dict[tuple, list[float]] = defaultdict(list)
+            # Raw (pred, actual) pairs per group — needed for isotonic fitting
+            raw_pairs: dict[tuple, tuple[list, list]] = defaultdict(lambda: ([], []))
+            n_matched = 0
 
-        # Compute residuals per (position, price_band)
-        from collections import defaultdict
-        residuals: dict[tuple, list[float]] = defaultdict(list)
+            for (player_id, gw_n), info in pred_at_gw.items():
+                actual = actuals.get((player_id, gw_n + 1))
+                if actual is None:
+                    continue
+                residual = actual - info["predicted"]
+                # Band = £ value rounded to nearest £1m  (value in pence × 10, so /10)
+                price_band = round(info["value"] / 10)
+                key = (info["position"], price_band)
+                residuals[key].append(residual)
+                raw_pairs[key][0].append(info["predicted"])
+                raw_pairs[key][1].append(actual)
+                n_matched += 1
 
-        for row in history_rows:
-            predicted = pred_map.get((row.player_id, row.gw_id))
-            if predicted is None:
-                continue
-            actual = float(row.total_points or 0)
-            residual = actual - predicted
-            pos, cost = player_info.get(row.player_id, (3, 50))
-            price_band = int(cost / 10)  # £5.0m → band 5
-            residuals[(int(pos), price_band)].append(residual)
+            if n_matched == 0:
+                logger.warning("Online calibration: 0 (prediction, actual) pairs matched — check data pipeline")
+                return
 
-        # Store calibration map in Redis (TTL 8 days — survives full GW window)
-        calibration_map = {
-            f"{pos}_{band}": round(sum(v) / len(v), 4)
-            for (pos, band), v in residuals.items()
-            if len(v) >= 3  # minimum sample for reliability
-        }
-        await redis_client.set(
-            "ml:calibration_map",
-            orjson.dumps(calibration_map).decode(),
-            ex=8 * 86400,
-        )
+            # ── Build calibration map with friendly keys ──────────────────────
+            # Format: "GK_4" → position_priceband (int band = £Xm)
+            # Admin endpoint parses: key.split("_",1) → [position_name, price_band]
+            pos_names = {1: "GK", 2: "DEF", 3: "MID", 4: "FWD"}
+            calibration_map = {
+                f"{pos_names.get(pos, str(pos))}_{band}": round(sum(v) / len(v), 4)
+                for (pos, band), v in residuals.items()
+                if len(v) >= 2  # minimum 2 samples
+            }
 
-        logger.info(
-            f"Online calibration updated: {len(calibration_map)} position/price groups, "
-            f"total residuals={sum(len(v) for v in residuals.values())}"
-        )
+            # ── Write to Redis (admin endpoint falls back to this if DB empty) ─
+            await redis_client.set(
+                "ml:calibration_map",
+                orjson.dumps(calibration_map).decode(),
+                ex=8 * 86400,
+            )
+
+            logger.info(
+                f"Online calibration updated: {len(calibration_map)} position/price groups, "
+                f"n_matched={n_matched}"
+            )
+
+            # ── Fit isotonic calibrators from raw (pred, actual) pairs ────────
+            # These are out-of-sample predictions (stored before each GW was
+            # played), so fitting isotonic regression on them is bias-free.
+            try:
+                if _fetcher is not None and hasattr(_fetcher, "xpts_model"):
+                    all_preds, all_actuals, all_pos, all_bands = [], [], [], []
+                    for (pos, band), (preds_list, actuals_list) in raw_pairs.items():
+                        for p, a in zip(preds_list, actuals_list):
+                            all_preds.append(p)
+                            all_actuals.append(a)
+                            all_pos.append(pos)
+                            all_bands.append(band)
+
+                    if all_preds:
+                        summary = _fetcher.xpts_model.train_calibrators(
+                            y_pred    = np.array(all_preds,   dtype=float),
+                            y_actual  = np.array(all_actuals, dtype=float),
+                            positions = np.array(all_pos,     dtype=int),
+                            price_bands = np.array(all_bands, dtype=int),
+                        )
+                        n_groups_fitted = len(summary)
+                        logger.info(
+                            f"Isotonic calibrators fitted: {n_groups_fitted} groups "
+                            f"({n_matched} (pred, actual) pairs)"
+                        )
+                        # Persist calibrator summary to Redis for admin panel
+                        await redis_client.set(
+                            "ml:isotonic_calibration_summary",
+                            orjson.dumps(summary).decode(),
+                            ex=8 * 86400,
+                        )
+            except Exception as _iso_err:
+                logger.warning(f"Isotonic calibrator fitting failed (non-fatal): {_iso_err}")
 
     except Exception as e:
         logger.error(f"Online calibration failed: {e}")
@@ -672,16 +1228,289 @@ async def _run_historical_retrain() -> None:
     Runs every 4th Sunday at 3:00 AM.
     """
     try:
+        import orjson as _orjson
+        from datetime import timezone as _tz
+        from core.redis_client import redis_client as _redis_retrain
         from data_pipeline.historical_fetcher import HistoricalFetcher
         async with HistoricalFetcher() as fetcher:
             # Train on last 3 seasons
             metrics = await fetcher.retrain_xpts_model(seasons=["2022-23", "2023-24", "2024-25"])
             logger.info(f"Historical retrain complete: {metrics}")
+            # ── Write feature importance to Redis for admin ML panel ─────────
+            fi = metrics.get("feature_importance", {})
+            if fi:
+                fi_list = sorted(
+                    [{"feature": k, "importance": int(v)} for k, v in fi.items()],
+                    key=lambda x: x["importance"], reverse=True
+                )
+                await _redis_retrain.set(
+                    "ml:feature_importance",
+                    _orjson.dumps(fi_list).decode(),
+                    ex=86400 * 30,
+                )
+            # ── Write SHAP importance to Redis ────────────────────────────────
+            # SHAP distributes credit fairly among correlated features
+            # (xa_last_5_gws, xg_last_5_gws etc.) unlike gain importance.
+            shap_fi = metrics.get("shap_importance", {})
+            if shap_fi:
+                shap_list = sorted(
+                    [{"feature": k, "importance": round(float(v), 4)} for k, v in shap_fi.items()],
+                    key=lambda x: x["importance"], reverse=True
+                )
+                await _redis_retrain.set(
+                    "ml:shap_importance",
+                    _orjson.dumps(shap_list).decode(),
+                    ex=86400 * 30,
+                )
+                logger.info(
+                    f"SHAP importance stored: top feature = "
+                    f"{shap_list[0]['feature']} ({shap_list[0]['importance']:.4f})"
+                    if shap_list else "SHAP list empty"
+                )
+            # ── Write model RMSE for Monte Carlo and calibration use ─────────
+            cv_rmse = metrics.get("cv_rmse")
+            if cv_rmse and isinstance(cv_rmse, float):
+                await _redis_retrain.set(
+                    "ml:model_rmse",
+                    str(round(cv_rmse, 4)),
+                    ex=86400 * 30,
+                )
+            # ── Write retrain timestamp ──────────────────────────────────────
+            await _redis_retrain.set(
+                "ml:last_retrain_ts",
+                datetime.now(_tz.utc).isoformat(),
+                ex=86400 * 30,
+            )
+            # ── Reload in-memory model so next prediction uses new artifact ──
+            if _fetcher is not None and hasattr(_fetcher, "xpts_model"):
+                _fetcher.xpts_model._load()
+                _fetcher.xpts_model._load_calibrators()
+                logger.info("In-memory xPts model + calibrators reloaded after historical retrain")
     except Exception as e:
         logger.error(f"Historical retrain failed: {e}")
         await _send_admin_alert_safe(
             "Historical Model Retrain Failed",
             f"_run_historical_retrain raised:\n\n{type(e).__name__}: {e}",
+        )
+
+
+async def _run_post_gw_retrain(gw_id: int | None = None) -> None:
+    """
+    Post-GW incremental retrain — fires ~45 min after the last game of each GW.
+
+    Why this exists vs the monthly historical retrain:
+    - The monthly retrain fires on the 4th Sunday regardless of GW timing.
+    - Every GW adds ~700 new (player, actual_points) training rows.  Waiting a
+      month means the model misses 4–5 GWs of fresh signal before correcting.
+    - This job runs from LOCAL DB data (no vaastav download) so it finishes in
+      under 60 seconds even on a cold container.
+
+    Pipeline:
+      1. Load feature history + actuals from DB (all ingested seasons).
+      2. Train a candidate model → compute SHAP + gain importance.
+      3. Compare candidate MAE vs current production MAE (last 5 GWs).
+      4. Promote candidate only if MAE improved (or no production model yet).
+      5. Write ml:shap_importance, ml:feature_importance to Redis.
+      6. Reload in-memory model + calibrators.
+      7. Re-run online calibration to fit isotonic calibrators for new model.
+
+    Idempotent: Redis key ml:post_gw_retrain:last_gw prevents double-running
+    for the same GW (e.g. container restart mid-chain).
+    """
+    try:
+        import orjson as _orjson
+        import numpy as _np
+        from datetime import timezone as _tz, timedelta as _td
+        from core.redis_client import redis_client as _rc
+        from core.database import AsyncSessionLocal
+        from models.db.feature_store import PlayerFeaturesHistory
+        from models.db.history import PlayerGWHistory
+        from sqlalchemy import select
+        import json as _json
+
+        # ── Idempotency guard ─────────────────────────────────────────────────
+        if gw_id is not None:
+            last_retrain_gw_raw = await _rc.get("ml:post_gw_retrain:last_gw")
+            last_retrain_gw = int(last_retrain_gw_raw) if last_retrain_gw_raw else None
+            if last_retrain_gw == gw_id:
+                logger.info(
+                    f"[post_gw_retrain] Already ran for GW{gw_id} — skipping"
+                )
+                return
+
+        logger.info(
+            f"[post_gw_retrain] Starting incremental retrain"
+            + (f" (GW{gw_id})" if gw_id else "")
+        )
+
+        # ── Step 1: Load training data from local DB ──────────────────────────
+        # Features stored in player_features_history contain the model's
+        # pre-GW predictions (predicted_xpts_next) and all feature values.
+        # Actuals are in player_gw_history.total_points for gw_id+1.
+        import pandas as _pd
+
+        async with AsyncSessionLocal() as db:
+            feat_res = await db.execute(
+                select(
+                    PlayerFeaturesHistory.player_id,
+                    PlayerFeaturesHistory.gw_id,
+                    PlayerFeaturesHistory.features_json,
+                ).order_by(PlayerFeaturesHistory.gw_id)
+            )
+            feat_rows = feat_res.fetchall()
+
+            hist_res = await db.execute(
+                select(
+                    PlayerGWHistory.player_id,
+                    PlayerGWHistory.gw_id,
+                    PlayerGWHistory.total_points,
+                )
+            )
+            hist_rows = hist_res.fetchall()
+
+        if not feat_rows or not hist_rows:
+            logger.warning("[post_gw_retrain] Insufficient DB data — skipping")
+            return
+
+        actuals_map: dict[tuple, float] = {
+            (int(r.player_id), int(r.gw_id)): float(r.total_points or 0)
+            for r in hist_rows
+        }
+
+        # Build rows: features at gw_id=N predict actual at gw_id=N+1
+        from models.ml.xpts_model import XPTS_FEATURES
+        records = []
+        for row in feat_rows:
+            fj = row.features_json
+            if isinstance(fj, str):
+                try:
+                    fj = _json.loads(fj)
+                except Exception:
+                    continue
+            if not isinstance(fj, dict):
+                continue
+            actual = actuals_map.get((int(row.player_id), int(row.gw_id) + 1))
+            if actual is None:
+                continue
+            record = {f: fj.get(f, 0.0) for f in XPTS_FEATURES}
+            record["actual_points"] = actual
+            records.append(record)
+
+        if len(records) < 200:
+            logger.warning(
+                f"[post_gw_retrain] Only {len(records)} matched rows — "
+                f"need ≥200 for meaningful retrain"
+            )
+            return
+
+        train_df = _pd.DataFrame(records).fillna(0)
+        logger.info(
+            f"[post_gw_retrain] Training dataset: {len(train_df)} rows, "
+            f"{len(XPTS_FEATURES)} features"
+        )
+
+        # ── Step 2: Train candidate model ─────────────────────────────────────
+        from models.ml.xpts_model import XPtsModel, MODEL_PATH
+        import joblib as _jl
+        import shutil as _sh
+        from pathlib import Path as _P
+
+        candidate = XPtsModel.__new__(XPtsModel)
+        candidate.model = None
+        candidate.calibrators = {}
+
+        metrics = candidate.train(train_df)
+        if "error" in metrics:
+            logger.error(f"[post_gw_retrain] Training failed: {metrics['error']}")
+            return
+
+        candidate_rmse = metrics.get("cv_rmse", 999.0)
+        logger.info(f"[post_gw_retrain] Candidate RMSE: {candidate_rmse:.4f}")
+
+        # ── Step 3: Compare candidate vs production MAE ───────────────────────
+        # Use cross-val RMSE as the comparison metric (computed inside train()).
+        prod_rmse_raw = await _rc.get("ml:cv_rmse")
+        prod_rmse = float(prod_rmse_raw) if prod_rmse_raw else None
+
+        should_promote = (
+            prod_rmse is None                      # no production model yet
+            or candidate_rmse < prod_rmse + 0.02   # candidate at most 0.02 worse
+            #  ^ allow tiny regressions to still promote so we don't get stuck
+        )
+
+        if not should_promote:
+            logger.info(
+                f"[post_gw_retrain] Candidate RMSE={candidate_rmse:.4f} worse than "
+                f"production RMSE={prod_rmse:.4f} by >{0.02} — NOT promoting"
+            )
+            return
+
+        # ── Step 4: Promote candidate ─────────────────────────────────────────
+        # candidate.train() already saved the model to MODEL_PATH (XPtsModel
+        # always writes to the shared artifact path). Record the production RMSE.
+        await _rc.set("ml:cv_rmse", str(round(candidate_rmse, 4)), ex=86400 * 30)
+        logger.info(
+            f"[post_gw_retrain] Promoted candidate: RMSE={candidate_rmse:.4f}"
+            + (f" (was {prod_rmse:.4f})" if prod_rmse else " (first model)")
+        )
+
+        # ── Step 5: Write importance metrics to Redis ─────────────────────────
+        now_iso = datetime.now(_tz.utc).isoformat()
+
+        fi = metrics.get("feature_importance", {})
+        if fi:
+            fi_list = sorted(
+                [{"feature": k, "importance": int(v)} for k, v in fi.items()],
+                key=lambda x: x["importance"], reverse=True,
+            )
+            await _rc.set(
+                "ml:feature_importance",
+                _orjson.dumps(fi_list).decode(),
+                ex=86400 * 30,
+            )
+
+        shap_fi = metrics.get("shap_importance", {})
+        if shap_fi:
+            shap_list = sorted(
+                [{"feature": k, "importance": round(float(v), 4)} for k, v in shap_fi.items()],
+                key=lambda x: x["importance"], reverse=True,
+            )
+            await _rc.set(
+                "ml:shap_importance",
+                _orjson.dumps(shap_list).decode(),
+                ex=86400 * 30,
+            )
+            logger.info(
+                f"[post_gw_retrain] SHAP stored — "
+                f"top: {shap_list[0]['feature']} ({shap_list[0]['importance']:.4f})"
+                if shap_list else "[post_gw_retrain] SHAP list empty"
+            )
+
+        await _rc.set("ml:last_retrain_ts", now_iso, ex=86400 * 30)
+        if gw_id is not None:
+            await _rc.set("ml:post_gw_retrain:last_gw", str(gw_id), ex=86400 * 7)
+
+        # ── Step 6: Reload in-memory model + calibrators ──────────────────────
+        if _fetcher is not None and hasattr(_fetcher, "xpts_model"):
+            _fetcher.xpts_model._load()
+            _fetcher.xpts_model._load_calibrators()
+            logger.info(
+                "[post_gw_retrain] In-memory xPts model + calibrators reloaded"
+            )
+
+        # ── Step 7: Refit isotonic calibrators for the new model ──────────────
+        # After a retrain the old calibrators map OLD model predictions → actuals.
+        # Re-running online calibration will collect fresh residuals using the
+        # updated model's prediction column from player_features_history and
+        # refit isotonic calibrators against actuals.
+        await _run_online_calibration()
+        logger.info("[post_gw_retrain] Isotonic calibrators refreshed for new model")
+
+    except Exception as e:
+        logger.error(f"[post_gw_retrain] Failed: {e}")
+        await _send_admin_alert_safe(
+            "Post-GW Retrain Failed",
+            f"_run_post_gw_retrain raised:\n\n{type(e).__name__}: {e}",
         )
 
 

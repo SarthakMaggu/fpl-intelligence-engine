@@ -1,7 +1,7 @@
 "use client";
 import { useEffect, useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import { Info, Crown, Zap, ArrowUpDown, ArrowLeftRight, AlertTriangle, Shuffle, TrendingUp } from "lucide-react";
+import { Info, Zap, ArrowUpDown, ArrowLeftRight, AlertTriangle } from "lucide-react";
 
 /* ── Engine icon — replaces generic Sparkles ──────────────────────────── */
 function IconEngine({ size = 11, style }: { size?: number; style?: React.CSSProperties }) {
@@ -39,7 +39,7 @@ function fdrStyle(fdr: number | null | undefined) {
 const POSITIONS: Record<number, string> = { 1: "GK", 2: "DEF", 3: "MID", 4: "FWD" };
 const CHIP_CONFIG: Record<string, {
   label: string;
-  Icon: React.ElementType;
+  abbr: string;
   description: string;
   accentColor: string;
   bgColor: string;
@@ -48,7 +48,7 @@ const CHIP_CONFIG: Record<string, {
 }> = {
   wildcard: {
     label: "WILDCARD",
-    Icon: Shuffle,
+    abbr: "WC",
     description: "Rebuild your entire squad — unlimited free transfers for one GW",
     accentColor: "#a855f7",
     bgColor: "rgba(168,85,247,0.07)",
@@ -57,7 +57,7 @@ const CHIP_CONFIG: Record<string, {
   },
   free_hit: {
     label: "FREE HIT",
-    Icon: Zap,
+    abbr: "FH",
     description: "Temporary squad for one GW — reverts to current squad after",
     accentColor: "#38bdf8",
     bgColor: "rgba(56,189,248,0.07)",
@@ -66,7 +66,7 @@ const CHIP_CONFIG: Record<string, {
   },
   bench_boost: {
     label: "BENCH BOOST",
-    Icon: TrendingUp,
+    abbr: "BB",
     description: "Score points from ALL 15 players — bench comes alive",
     accentColor: "#22c55e",
     bgColor: "rgba(34,197,94,0.07)",
@@ -75,7 +75,7 @@ const CHIP_CONFIG: Record<string, {
   },
   triple_captain: {
     label: "TRIPLE CAPTAIN",
-    Icon: Crown,
+    abbr: "TC",
     description: "Captain scores 3x instead of 2x — premium pick",
     accentColor: "#f59e0b",
     bgColor: "rgba(245,158,11,0.07)",
@@ -84,16 +84,9 @@ const CHIP_CONFIG: Record<string, {
   },
 };
 
-interface GWState {
-  state: "pre_deadline" | "deadline_passed" | "finished" | "unknown";
-  current_gw: number | null;
-  next_gw: number | null;
-  deadline_time: string | null;
-  finished: boolean;
-}
-
 export default function StrategyPage() {
-  const { fixtureSwings, fetchFixtureSwings, squad, captainCandidates, fetchCaptains, fetchSquad, teamId } = useFPLStore();
+  const { fixtureSwings, fetchFixtureSwings, squad, captainCandidates, fetchCaptains, fetchSquad, teamId, anonymousSessionToken, gwState, gwStateLoaded, fetchGwState } = useFPLStore();
+  const isAnonymous = !teamId || !!anonymousSessionToken;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const [chipRecs, setChipRecs] = useState<Record<string, any> | null>(null);
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -106,9 +99,9 @@ export default function StrategyPage() {
   const [benchTransferXI, setBenchTransferXI] = useState<any | null>(null);
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const [banditState, setBanditState] = useState<any | null>(null);
-  const [gwState, setGwState] = useState<GWState | null>(null);
 
   useEffect(() => {
+    fetchGwState(); // shared global — no re-flash on tab switch
     fetchFixtureSwings();
     fetchCaptains();
     if (!squad) fetchSquad();
@@ -133,11 +126,6 @@ export default function StrategyPage() {
       .then((r) => r.ok ? r.json() : null)
       .then((d) => d && setBanditState(d))
       .catch(() => {});
-    // Fetch GW state to know whether to show strategy or waiting message
-    fetch(`${API}/api/gameweeks/current`)
-      .then((r) => r.ok ? r.json() : null)
-      .then((d) => d && setGwState(d))
-      .catch(() => {});
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -155,36 +143,56 @@ export default function StrategyPage() {
           </div>
         </div>
 
-        {/* ══ GW AWAITING RESULTS — deadline passed, games not yet started ═══ */}
-        {gwState && gwState.state === "deadline_passed" && !gwState.finished && (
+        {/* ══ GW state loading — show nothing until we know the state (prevents content flash) ══ */}
+        {!gwStateLoaded && (
+          <div style={{ minHeight: 120 }} />
+        )}
+
+        {/* ══ GW UNDERWAY — full block, hides all strategy content ══ */}
+        {gwStateLoaded && gwState?.state === "deadline_passed" && !gwState.finished && (
           <motion.div
-            initial={{ opacity: 0 }}
-            animate={{ opacity: 1 }}
+            initial={{ opacity: 0, y: 8 }}
+            animate={{ opacity: 1, y: 0 }}
             transition={{ duration: 0.4 }}
             style={{
               borderRadius: 16,
-              padding: "32px 28px",
+              padding: "40px 28px",
               background: "var(--surface)",
-              border: "1px solid var(--divider)",
+              border: "1px solid rgba(245,158,11,0.25)",
               textAlign: "center",
             }}
           >
-            <div style={{ fontFamily: "var(--font-data)", fontSize: 10, color: "var(--text-3)", letterSpacing: "0.18em", textTransform: "uppercase", marginBottom: 16 }}>
-              GW{gwState.current_gw} · DEADLINE PASSED
+            <div style={{
+              display: "inline-flex", alignItems: "center", gap: 6,
+              padding: "4px 12px", borderRadius: 999,
+              background: "rgba(245,158,11,0.12)", border: "1px solid rgba(245,158,11,0.3)",
+              marginBottom: 20,
+            }}>
+              <span style={{ width: 6, height: 6, borderRadius: "50%", background: "var(--amber)", display: "inline-block", animation: "pulse 1.5s infinite" }} />
+              <span style={{ fontFamily: "var(--font-data)", fontSize: 9, fontWeight: 700, color: "var(--amber)", letterSpacing: "0.16em", textTransform: "uppercase" }}>
+                GW{gwState.current_gw} LIVE
+              </span>
             </div>
-            <h2 style={{ fontFamily: "var(--font-display)", fontSize: "clamp(24px, 4vw, 36px)", fontWeight: 700, color: "var(--text-1)", letterSpacing: "-0.04em", margin: "0 0 12px", lineHeight: 1 }}>
-              Awaiting GW{gwState.current_gw} Results
+            <h2 style={{ fontFamily: "var(--font-display)", fontSize: "clamp(22px, 4vw, 34px)", fontWeight: 700, color: "var(--text-1)", letterSpacing: "-0.04em", margin: "0 0 12px", lineHeight: 1.1 }}>
+              GW{gwState.current_gw} Is Underway
             </h2>
-            <p style={{ fontFamily: "var(--font-ui)", fontSize: 13, color: "var(--text-3)", lineHeight: 1.7, maxWidth: 400, margin: "0 auto" }}>
-              Squad is locked. Strategy for GW{gwState.next_gw ?? ((gwState.current_gw ?? 0) + 1)} will appear once fixtures complete.
+            <p style={{ fontFamily: "var(--font-ui)", fontSize: 13, color: "var(--text-3)", lineHeight: 1.7, maxWidth: 420, margin: "0 auto 24px" }}>
+              Squad is locked. Fixtures are in play — sit back and watch the points roll in.
+              Strategy for GW{gwState.next_gw ?? ((gwState.current_gw ?? 0) + 1)} will appear once all results are in.
             </p>
+            <div style={{ fontFamily: "var(--font-ui)", fontSize: 11, color: "var(--text-3)", letterSpacing: "0.06em" }}>
+              Check the <strong style={{ color: "var(--text-2)" }}>Live Score</strong> tab for real-time points
+            </div>
           </motion.div>
         )}
+
+        {/* ══ All strategy content — only shown when GW state loaded AND GW is NOT underway ══ */}
+        {gwStateLoaded && (!gwState || gwState.state !== "deadline_passed" || gwState.finished) && (<>
 
         {/* ══ BEST PLAYS THIS WEEK — top-level synthesis card ════════ */}
         {(captainCandidates.length > 0 || chipRecs || benchSwaps?.swaps?.length > 0) && (() => {
           // Build a ranked list of the best single action per category
-          type Play = { rank: number; icon: React.ElementType; label: string; detail: string; impact: string; color: string; urgent?: boolean; team_code?: number | null };
+          type Play = { rank: number; icon: React.ElementType | null; label: string; detail: string; impact: string; color: string; urgent?: boolean; team_code?: number | null };
           const plays: Play[] = [];
           let rank = 1;
 
@@ -193,7 +201,7 @@ export default function StrategyPage() {
             const c = captainCandidates[0];
             const xp = (c.predicted_xpts_next ?? 0).toFixed(1);
             plays.push({
-              rank: rank++, icon: Crown,
+              rank: rank++, icon: null,
               label: `Captain ${c.web_name}`,
               detail: `${xp} xPts expected · ${c.has_double_gw ? "DGW · " : ""}${c.reasoning?.slice(0, 60) ?? ""}`,
               impact: `${xp} xPts`, color: "var(--amber)", urgent: (c.predicted_xpts_next ?? 0) >= 7,
@@ -226,28 +234,31 @@ export default function StrategyPage() {
             });
           }
 
-          // Transfer suggestion from bench-transfer XI
-          if (benchTransferXI?.suggestions?.[0]) {
-            const s = benchTransferXI.suggestions[0];
-            plays.push({
-              rank: rank++, icon: ArrowLeftRight,
-              label: `Transfer in ${s.transfer_in?.web_name}`,
-              detail: `Out: ${s.bench_out?.web_name} · £${s.cost_millions}m`,
-              impact: `+${s.net_gain?.toFixed(1)} xPts`, color: "var(--blue)",
-              team_code: s.transfer_in?.team_code ?? null,
-            });
-          }
-
-          // Rotation risk alert
-          if (squad?.squad) {
-            const highRisk = squad.squad.find((p) => p.position <= 11 && (p.predicted_start_prob ?? 1) < 0.40);
-            if (highRisk) {
+          // Transfer suggestion and rotation risk — only before deadline (can't transfer during active GW)
+          const deadlineNotPassed = !gwState || gwState.state === "pre_deadline";
+          if (deadlineNotPassed) {
+            if (benchTransferXI?.suggestions?.[0]) {
+              const s = benchTransferXI.suggestions[0];
               plays.push({
-                rank: rank++, icon: AlertTriangle,
-                label: `Consider selling ${highRisk.web_name}`,
-                detail: `Start probability only ${Math.round((highRisk.predicted_start_prob ?? 0) * 100)}% — high rotation risk`,
-                impact: "Risk mgmt", color: "var(--red)",
+                rank: rank++, icon: ArrowLeftRight,
+                label: `Transfer in ${s.transfer_in?.web_name}`,
+                detail: `Out: ${s.bench_out?.web_name} · £${s.cost_millions}m`,
+                impact: `+${s.net_gain?.toFixed(1)} xPts`, color: "var(--blue)",
+                team_code: s.transfer_in?.team_code ?? null,
               });
+            }
+
+            if (squad?.squad) {
+              const highRisk = squad.squad.find((p) => p.position <= 11 && (p.predicted_start_prob ?? 1) < 0.40);
+              if (highRisk) {
+                plays.push({
+                  rank: rank++, icon: AlertTriangle,
+                  label: `Consider selling ${highRisk.web_name}`,
+                  detail: `Start probability only ${Math.round((highRisk.predicted_start_prob ?? 0) * 100)}% — high rotation risk`,
+                  impact: "Risk mgmt", color: "var(--red)",
+                  team_code: (highRisk as any).team_code ?? null,
+                });
+              }
             }
           }
 
@@ -344,7 +355,7 @@ export default function StrategyPage() {
               {captainCandidates.slice(0, 5).map((c, i) => {
                 const isHero     = i === 0;
                 const xPts       = c.predicted_xpts_next ?? 0;
-                const isConfirmed = isHero && xPts >= 7.0;
+                const isConfirmed = false; // removed status badge per product decision
                 return (
                   <motion.div
                     key={c.player_id}
@@ -461,144 +472,86 @@ export default function StrategyPage() {
         )}
 
         {chipRecs && Object.keys(chipRecs).length > 0 && (
-          <Section title="Chip Strategy" accent="#a855f7">
-            {/* ENGINE ACTION BANNER — urgent chip */}
-            {(() => {
-              const urgentEntry = Object.entries(chipRecs).find(([, rec]: [string, any]) => rec.urgency === "urgent");
-              if (!urgentEntry) return null;
-              const [chip, rec]: [string, any] = urgentEntry;
-              const cfg = CHIP_CONFIG[chip];
-              const UrgentIcon = cfg?.Icon ?? Zap;
-              return (
-                <motion.div
-                  initial={{ opacity: 0, scale: 0.98 }}
-                  animate={{ opacity: 1, scale: 1 }}
-                  transition={{ type: "spring", stiffness: 300, damping: 28 }}
-                  style={{
-                    display: "flex", alignItems: "center", gap: 10, marginBottom: 16,
-                    padding: "10px 14px", borderRadius: 10,
-                    background: cfg?.bgColor ?? "rgba(34,197,94,0.07)",
-                    border: `1px solid ${cfg?.borderColor ?? "rgba(34,197,94,0.25)"}`,
-                    boxShadow: `0 0 20px ${cfg?.glowColor ?? "transparent"}`,
-                  }}
-                >
-                  <div style={{ width: 28, height: 28, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
-                    <UrgentIcon size={18} style={{ color: cfg?.accentColor ?? "var(--green)" }} />
-                  </div>
-                  <div style={{ flex: 1, minWidth: 0 }}>
-                    <div style={{ fontFamily: "var(--font-display)", fontSize: 12, fontWeight: 700, color: cfg?.accentColor ?? "var(--green)", letterSpacing: "0.03em", marginBottom: 2 }}>
-                      PLAY NOW: {cfg?.label ?? chip.toUpperCase()} · GW{rec.recommended_gw ?? rec.best_gw}
-                    </div>
-                    <div style={{ fontFamily: "var(--font-ui)", fontSize: 11, color: "var(--text-2)" }}>
-                      +{rec.expected_gain?.toFixed(1)} xPts gain expected{rec.confidence != null ? ` · ${Math.round(rec.confidence * 100)}% confidence` : ""}
-                    </div>
-                  </div>
-                  <span style={{
-                    fontFamily: "var(--font-ui)", fontSize: 9, fontWeight: 700,
-                    color: cfg?.accentColor ?? "var(--green)",
-                    background: cfg?.bgColor ?? "rgba(34,197,94,0.12)",
-                    border: `1px solid ${cfg?.borderColor ?? "rgba(34,197,94,0.25)"}`,
-                    borderRadius: 999, padding: "3px 10px", letterSpacing: "0.08em", flexShrink: 0,
-                  }}>NOW</span>
-                </motion.div>
-              );
-            })()}
-
-            {/* Per-chip cards — distinctive visual per chip type */}
-            <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+          <Section title="Chip Strategy" accent="var(--text-3)">
+            <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
               {Object.entries(chipRecs).map(([chip, rec]: [string, any], i) => {
                 const cfg = CHIP_CONFIG[chip];
-                const ChipIcon = cfg?.Icon ?? Zap;
                 const isUrgent = rec.urgency === "urgent";
                 const gwNum = rec.recommended_gw ?? rec.best_gw;
-                const gain = rec.expected_gain?.toFixed(1);
+                const gain = rec.expected_gain != null ? rec.expected_gain.toFixed(1) : null;
                 const conf = rec.confidence != null ? Math.round(rec.confidence * 100) : null;
 
                 return (
                   <motion.div
                     key={chip}
-                    initial={{ opacity: 0, x: -12 }}
+                    initial={{ opacity: 0, x: -8 }}
                     animate={{ opacity: 1, x: 0 }}
-                    transition={{ delay: i * 0.1, type: "spring", stiffness: 280, damping: 26 }}
+                    transition={{ delay: i * 0.06, type: "spring", stiffness: 300, damping: 26 }}
                     style={{
                       display: "flex",
-                      gap: 14,
-                      alignItems: "flex-start",
+                      alignItems: "center",
+                      gap: 10,
+                      padding: "10px 12px",
                       background: "rgba(255,255,255,0.02)",
-                      border: `1px solid ${isUrgent ? (cfg?.borderColor ?? "var(--divider)") : "var(--divider)"}`,
+                      border: "1px solid var(--divider)",
                       borderLeft: `3px solid ${cfg?.accentColor ?? "var(--text-3)"}`,
-                      borderRadius: 12,
-                      padding: "14px 16px",
-                      boxShadow: isUrgent ? `0 0 24px ${cfg?.glowColor ?? "transparent"}` : undefined,
+                      borderRadius: 10,
                     }}
                   >
-                    {/* Left: icon box */}
-                    <div style={{
-                      width: 40, height: 40, borderRadius: 10, flexShrink: 0,
-                      display: "flex", alignItems: "center", justifyContent: "center",
-                      background: "rgba(255,255,255,0.04)",
-                      border: `1px solid ${cfg?.borderColor ?? "var(--divider)"}`,
+                    {/* Chip abbreviation tag */}
+                    <span style={{
+                      fontFamily: "var(--font-data)",
+                      fontSize: 10,
+                      fontWeight: 700,
+                      color: cfg?.accentColor ?? "var(--text-3)",
+                      background: `${cfg?.accentColor ?? "var(--text-3)"}18`,
+                      border: `1px solid ${cfg?.accentColor ?? "var(--text-3)"}33`,
+                      borderRadius: 4,
+                      padding: "2px 5px",
+                      letterSpacing: "0.06em",
+                      flexShrink: 0,
+                      whiteSpace: "nowrap",
                     }}>
-                      <ChipIcon size={20} style={{ color: cfg?.accentColor ?? "var(--text-2)" }} />
-                    </div>
+                      {cfg?.abbr ?? chip.slice(0, 2).toUpperCase()}
+                    </span>
 
-                    {/* Right: content */}
-                    <div style={{ flex: 1, minWidth: 0, position: "relative", zIndex: 1 }}>
-                      {/* Header row */}
-                      <div style={{ display: "flex", alignItems: "center", gap: 7, marginBottom: 4 }}>
-                        <span style={{
-                          fontFamily: "var(--font-display)", fontSize: 12, fontWeight: 700,
-                          color: cfg?.accentColor ?? "var(--text-1)", letterSpacing: "0.04em",
-                        }}>
+                    {/* Label + description */}
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 1 }}>
+                        <span style={{ fontFamily: "var(--font-display)", fontSize: 13, fontWeight: 600, color: "var(--text-1)", letterSpacing: "-0.01em" }}>
                           {cfg?.label ?? chip.toUpperCase().replace(/_/g, " ")}
                         </span>
                         {isUrgent && (
                           <span style={{
                             fontFamily: "var(--font-ui)", fontSize: 8, fontWeight: 700,
                             color: cfg?.accentColor ?? "var(--green)",
-                            background: cfg?.bgColor ?? "rgba(34,197,94,0.12)",
-                            border: `1px solid ${cfg?.borderColor ?? "rgba(34,197,94,0.3)"}`,
-                            borderRadius: 999, padding: "1px 7px", letterSpacing: "0.08em",
-                          }}>PLAY NOW</span>
+                            background: `${cfg?.accentColor ?? "var(--green)"}18`,
+                            border: `1px solid ${cfg?.accentColor ?? "var(--green)"}33`,
+                            borderRadius: 999, padding: "1px 6px", letterSpacing: "0.08em", flexShrink: 0,
+                          }}>NOW</span>
                         )}
                       </div>
+                      <p style={{ fontFamily: "var(--font-ui)", fontSize: 10, color: "var(--text-3)", margin: 0, lineHeight: 1.4 }}>
+                        {rec.reasoning ?? cfg?.description ?? ""}
+                      </p>
+                    </div>
 
-                      {/* Description */}
-                      <div style={{ fontFamily: "var(--font-ui)", fontSize: 10, color: "var(--text-3)", lineHeight: 1.45, marginBottom: 8 }}>
-                        {cfg?.description ?? rec.reasoning ?? ""}
-                      </div>
-
-                      {/* Stats row */}
-                      <div style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
-                        <div>
-                          <span style={{ fontFamily: "var(--font-ui)", fontSize: 9, color: "var(--text-3)", letterSpacing: "0.06em", textTransform: "uppercase", display: "block", marginBottom: 1 }}>Optimal GW</span>
-                          <span style={{ fontFamily: "var(--font-data)", fontSize: 22, fontWeight: 700, color: cfg?.accentColor ?? "var(--text-1)", letterSpacing: "-0.03em", lineHeight: 1 }}>
-                            {gwNum ?? "—"}
-                          </span>
-                        </div>
-                        {gain && (
-                          <div>
-                            <span style={{ fontFamily: "var(--font-ui)", fontSize: 9, color: "var(--text-3)", letterSpacing: "0.06em", textTransform: "uppercase", display: "block", marginBottom: 1 }}>Expected gain</span>
-                            <span style={{ fontFamily: "var(--font-data)", fontSize: 18, fontWeight: 600, color: cfg?.accentColor ?? "var(--green)", letterSpacing: "-0.02em", lineHeight: 1 }}>
-                              +{gain} xP
-                            </span>
-                          </div>
-                        )}
-                        {conf != null && (
-                          <div>
-                            <span style={{ fontFamily: "var(--font-ui)", fontSize: 9, color: "var(--text-3)", letterSpacing: "0.06em", textTransform: "uppercase", display: "block", marginBottom: 1 }}>Confidence</span>
-                            <span style={{ fontFamily: "var(--font-data)", fontSize: 16, fontWeight: 600, color: conf >= 70 ? (cfg?.accentColor ?? "var(--green)") : "var(--text-2)", letterSpacing: "-0.02em", lineHeight: 1 }}>
-                              {conf}%
-                            </span>
-                          </div>
-                        )}
-                      </div>
-
-                      {/* Reasoning if different from description */}
-                      {rec.reasoning && rec.reasoning !== cfg?.description && (
-                        <div style={{ marginTop: 8, fontFamily: "var(--font-ui)", fontSize: 10, color: "var(--text-3)", lineHeight: 1.45, fontStyle: "italic" }}>
-                          {rec.reasoning}
-                        </div>
+                    {/* Stats: GW · gain · confidence */}
+                    <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 2, flexShrink: 0 }}>
+                      {gwNum && (
+                        <span style={{ fontFamily: "var(--font-data)", fontSize: 13, fontWeight: 700, color: cfg?.accentColor ?? "var(--text-1)", letterSpacing: "-0.02em" }}>
+                          GW{gwNum}
+                        </span>
+                      )}
+                      {gain && (
+                        <span style={{ fontFamily: "var(--font-data)", fontSize: 11, fontWeight: 600, color: "var(--green)", letterSpacing: "-0.01em" }}>
+                          +{gain} xP
+                        </span>
+                      )}
+                      {conf != null && (
+                        <span style={{ fontFamily: "var(--font-ui)", fontSize: 9, color: "var(--text-3)" }}>
+                          {conf}% conf
+                        </span>
                       )}
                     </div>
                   </motion.div>
@@ -635,8 +588,8 @@ export default function StrategyPage() {
                           </div>
                         </td>
                         <td style={{ textAlign: "center", padding: "6px 8px" }}><span style={{ fontFamily: "var(--font-ui)", fontSize: 9, fontWeight: 600, color: "var(--text-3)", letterSpacing: "0.06em" }}>{POSITIONS[p.element_type] ?? "—"}</span></td>
-                        <td style={{ textAlign: "center", padding: "6px 8px" }}><span style={{ display: "inline-block", background: s.bg, color: s.color, borderRadius: 6, padding: "2px 10px", fontFamily: "var(--font-data)", fontSize: 12, fontWeight: 600 }}>{p.fdr_next ?? "—"}</span></td>
-                        <td style={{ textAlign: "center", fontFamily: "var(--font-ui)", fontSize: 11, color: "var(--text-3)", padding: "6px 8px" }}>{p.is_home_next === null || p.is_home_next === undefined ? "—" : p.is_home_next ? "H" : "A"}</td>
+                        <td style={{ textAlign: "center", padding: "6px 8px" }}><span style={{ display: "inline-block", background: s.bg, color: s.color, borderRadius: 6, padding: "2px 10px", fontFamily: "var(--font-data)", fontSize: 12, fontWeight: 600 }}>{p.fdr_next === 0 ? "BGW" : (p.fdr_next ?? "—")}</span></td>
+                        <td style={{ textAlign: "center", fontFamily: "var(--font-ui)", fontSize: 11, color: "var(--text-3)", padding: "6px 8px" }}>{p.fdr_next === 0 ? "—" : p.is_home_next === null || p.is_home_next === undefined ? "—" : p.is_home_next ? "H" : "A"}</td>
                         <td style={{ textAlign: "center", padding: "6px 8px" }}><span style={{ fontFamily: "var(--font-data)", fontSize: 13, fontWeight: 600, color: "var(--green)", letterSpacing: "-0.02em" }}>{p.predicted_xpts_next != null ? p.predicted_xpts_next.toFixed(1) : "—"}</span></td>
                       </tr>
                     );
@@ -804,7 +757,7 @@ export default function StrategyPage() {
           </Section>
         )}
 
-        {banditState && banditState.decision_states && (
+        {banditState && banditState.decision_states && !isAnonymous && (
           <Section
             title="RL Decision Engine"
             accent="var(--blue)"
@@ -884,15 +837,33 @@ export default function StrategyPage() {
                     <div style={{ fontFamily: "var(--font-display)", fontSize: 13, fontWeight: 700, color: "var(--text-1)", marginBottom: 4 }}>{bestArm}</div>
                     <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
                       <span style={{ fontFamily: "var(--font-data)", fontSize: 10, color: "var(--text-3)" }}>
-                        {totalPulls === 0 ? "no history yet" : `${totalPulls} obs`}
+                        {totalPulls === 0 ? "collecting data" : `${totalPulls} obs`}
                       </span>
-                      {totalPulls === 0 && <span style={{ fontFamily: "var(--font-ui)", fontSize: 9, color: "var(--text-3)", background: "rgba(148,163,184,0.1)", borderRadius: 4, padding: "1px 5px" }}>learning</span>}
+                      {totalPulls === 0 && <span style={{ fontFamily: "var(--font-ui)", fontSize: 9, color: "var(--text-3)", background: "rgba(148,163,184,0.1)", borderRadius: 4, padding: "1px 5px" }}>&#8203;starts after GW ends</span>}
                       {totalPulls > 0 && isExploring && <span style={{ fontFamily: "var(--font-ui)", fontSize: 9, color: "var(--amber)", background: "rgba(245,158,11,0.1)", borderRadius: 4, padding: "1px 5px" }}>exploring</span>}
                       {isBestDecision && <span style={{ fontFamily: "var(--font-ui)", fontSize: 9, color: "var(--blue)", background: "rgba(59,130,246,0.12)", borderRadius: 4, padding: "1px 5px" }}>best</span>}
                     </div>
                   </motion.div>
                 );
               })}
+            </div>
+          </Section>
+        )}
+
+        {isAnonymous && (
+          <Section title="RL Decision Engine" accent="var(--blue)">
+            <div style={{
+              padding: "20px 16px", borderRadius: 12,
+              background: "rgba(59,130,246,0.05)", border: "1px solid rgba(59,130,246,0.18)",
+              textAlign: "center",
+            }}>
+              <div style={{ fontFamily: "var(--font-ui)", fontSize: 12, fontWeight: 600, color: "var(--blue)", marginBottom: 6 }}>
+                Register to unlock AI learning
+              </div>
+              <div style={{ fontFamily: "var(--font-ui)", fontSize: 11, color: "var(--text-3)", lineHeight: 1.6 }}>
+                The RL Decision Engine learns which strategies work best for your squad over time.
+                <br />Register with your email to persist decision history and enable personalised learning.
+              </div>
             </div>
           </Section>
         )}
@@ -977,6 +948,8 @@ export default function StrategyPage() {
             sync your squad on the pitch page to load strategy data.
           </div>
         )}
+
+        </>) /* end: strategy content guard — hidden while GW is underway */}
       </main>
       <BottomDock />
     </div>

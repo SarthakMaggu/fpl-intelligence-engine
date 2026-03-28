@@ -1,13 +1,15 @@
 """GW Intelligence routes — fixture swings, yellow cards, full GW brief."""
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, text
+from sqlalchemy import select, func, text, and_
+from datetime import datetime
 
 from api.deps import get_db_session, get_team_context
 from core.config import settings
 from models.db.player import Player
 from models.db.gameweek import Gameweek, Fixture
 from models.db.user_squad import UserSquad, UserBank
+from models.db.decision_log import DecisionLog
 from services.cache_service import ANALYSIS_TTL, FIXTURE_TTL, get_cached_payload, set_cached_payload
 from services.decision_engine import decision_engine, DecisionContext
 
@@ -166,6 +168,108 @@ async def get_gw_intelligence(
         if p.has_double_gw
     ]
 
+    # ── Free transfers + 0-FT advice ─────────────────────────────────────────
+    bank_res = await db.execute(
+        select(UserBank).where(UserBank.team_id == active_team_id)
+    )
+    bank = bank_res.scalar_one_or_none()
+    free_transfers = bank.free_transfers if bank else 1
+
+    zero_ft_advice = None
+    if free_transfers == 0 and squad_players:
+        pick_map = {p.player_id: p for p in picks}
+
+        starters = [p for p in squad_players if pick_map.get(p.id) and pick_map[p.id].position <= 11]
+        bench    = [p for p in squad_players if pick_map.get(p.id) and pick_map[p.id].position >= 12]
+
+        # Bench-to-XI swaps: bench player with better xPts than worst starter of same type
+        bench_swaps = []
+        for b in bench:
+            b_xpts = b.predicted_xpts_next or 0
+            if b_xpts <= 0:
+                continue
+            same_pos_starters = [s for s in starters if s.element_type == b.element_type]
+            if not same_pos_starters:
+                continue
+            worst = min(same_pos_starters, key=lambda s: s.predicted_xpts_next or 0)
+            w_xpts = worst.predicted_xpts_next or 0
+            if b_xpts > w_xpts + 0.5:
+                bench_swaps.append({
+                    "out": {
+                        "player_id": worst.id,
+                        "web_name": worst.web_name,
+                        "xpts": round(w_xpts, 2),
+                        "element_type": worst.element_type,
+                        "team_code": _team_code(worst.team_id),
+                    },
+                    "in": {
+                        "player_id": b.id,
+                        "web_name": b.web_name,
+                        "xpts": round(b_xpts, 2),
+                        "element_type": b.element_type,
+                        "team_code": _team_code(b.team_id),
+                    },
+                    "gain": round(b_xpts - w_xpts, 2),
+                })
+        bench_swaps.sort(key=lambda x: -x["gain"])
+
+        # Optimal XI from current 15 (greedy valid selection)
+        from optimizers.lineup_simulator import LineupSimulator, SquadPlayerInput
+        sim_inputs = [
+            SquadPlayerInput(
+                player_id=p.id,
+                web_name=p.web_name,
+                position=pick_map[p.id].position,
+                element_type=p.element_type,
+                xpts=p.predicted_xpts_next or 0,
+                is_bench=pick_map[p.id].position >= 12,
+            )
+            for p in squad_players if pick_map.get(p.id)
+        ]
+        _sim = LineupSimulator(n_sims=1, seed=0)
+        optimal_xi_players = _sim._best_valid_xi(sim_inputs)
+        ilp_optimal_xi = [
+            {
+                "player_id": p.player_id,
+                "web_name": p.web_name,
+                "element_type": p.element_type,
+                "xpts": round(p.xpts, 2),
+            }
+            for p in sorted(optimal_xi_players, key=lambda x: (x.element_type, -x.xpts))
+        ]
+
+        # Chip suggestion
+        chip_suggestion = None
+        blank_count = len(blank_starters)
+        if blank_count >= 3:
+            chip_suggestion = {
+                "chip": "free_hit",
+                "reason": f"{blank_count} starters have no fixture — Free Hit recommended.",
+                "urgency": "urgent" if blank_count >= 5 else "monitor",
+            }
+        elif sum(p.predicted_xpts_next or 0 for p in starters) < 42:
+            chip_suggestion = {
+                "chip": "wildcard",
+                "reason": "Squad xPts below baseline — consider Wildcard to rebuild.",
+                "urgency": "plan",
+            }
+
+        if chip_suggestion and chip_suggestion["urgency"] == "urgent":
+            verdict = "chip"
+        elif bench_swaps:
+            verdict = "bench_swap"
+        elif chip_suggestion:
+            verdict = "chip"
+        else:
+            verdict = "hold"
+
+        zero_ft_advice = {
+            "bench_swaps": bench_swaps,
+            "chip_suggestion": chip_suggestion,
+            "ilp_optimal_xi": ilp_optimal_xi,
+            "verdict": verdict,
+        }
+
     payload = {
         "gameweek": display_gw.id,
         "deadline": display_gw.deadline_time.isoformat() if display_gw.deadline_time else None,
@@ -175,6 +279,8 @@ async def get_gw_intelligence(
         "blank_gw_starters": blank_starters,
         "double_gw_players": double_players,
         "squad_size": len(picks),
+        "free_transfers": free_transfers,
+        "zero_ft_advice": zero_ft_advice,
         "analysis_mode": "full",
         "decision_engine_mode": settings.DECISION_ENGINE_MODE,
         "data_freshness": display_gw.deadline_time.isoformat() if display_gw.deadline_time else None,
@@ -343,6 +449,29 @@ async def get_priority_actions(
     free_transfers = bank.free_transfers if bank else 1
     bank_pence = bank.bank if bank else 0
 
+    # ── GW Underway Gate ─────────────────────────────────────────────────────
+    # If the GW deadline has passed but the GW is not yet finished, the squad
+    # is locked — no transfers, no bench changes, no captain changes possible.
+    # Return early with an empty action list so nothing gets logged and the
+    # home page shows a "GW underway" state instead of stale suggestions.
+    from datetime import datetime as _dt_check
+    _now = _dt_check.utcnow()
+    _gw_underway = (
+        not current_gw.finished
+        and current_gw.deadline_time is not None
+        and current_gw.deadline_time < _now
+    )
+    if _gw_underway:
+        return {
+            "gameweek": current_gw.id,
+            "free_transfers": free_transfers,
+            "actions": [],
+            "total_actions": 0,
+            "gw_state": "underway",
+            "message": f"GW{current_gw.id} is underway — squad locked, fixtures in play",
+            "decision_engine_mode": settings.DECISION_ENGINE_MODE,
+        }
+
     # ── Player lookups ────────────────────────────────────────────────────────
     squad_ids = [p.player_id for p in picks]
     xi_ids = [p.player_id for p in picks if p.position <= 11]
@@ -357,6 +486,11 @@ async def get_priority_actions(
 
     result = await db.execute(select(Player))
     all_players = result.scalars().all()
+
+    # Build team_code lookup early (used across all action types for crest logos)
+    from models.db.team import Team as TeamModel
+    team_map_res = await db.execute(select(TeamModel))
+    team_map = {t.id: t for t in team_map_res.scalars().all()}
 
     actions: list[dict] = []
 
@@ -388,6 +522,8 @@ async def get_priority_actions(
             "reasoning": player.news or f"{player.web_name} unavailable for next fixture",
             "decision_type": "transfer_strategy",
             "recommended_option": f"Transfer out {player.web_name}",
+            "team_code": team_map[player.team_id].code if player.team_id in team_map else None,
+            "player_id_primary": player.id,  # for badge + gain tracking
         })
 
     # ── 2. Captain recommendation ─────────────────────────────────────────────
@@ -401,6 +537,8 @@ async def get_priority_actions(
             "player_id": p.id,
             "web_name": p.web_name,
             "element_type": p.element_type,
+            "team_id": p.team_id,
+            "team_code": team_map[p.team_id].code if p.team_id in team_map else None,
             "predicted_xpts_next": p.predicted_xpts_next or 0,
             "has_blank_gw": p.has_blank_gw or False,
             "fdr_next": p.fdr_next or 3,
@@ -429,13 +567,12 @@ async def get_priority_actions(
             ),
             "decision_type": "captain_pick",
             "recommended_option": f"{top_captain['web_name']} (C)",
+            "team_code": top_captain.get("team_code"),
+            "player_id_primary": top_captain.get("player_id"),  # for gain tracking
         })
 
     # ── 3. Transfer suggestions (lightweight greedy engine) ───────────────────
     try:
-        result = await db.execute(select(TeamModel))
-        team_map = {t.id: t for t in result.scalars().all()}
-
         df = pd.DataFrame([{
             "id": p.id,
             "web_name": p.web_name,
@@ -478,6 +615,10 @@ async def get_priority_actions(
                 "reasoning": s.reasoning,
                 "decision_type": "transfer_strategy",
                 "recommended_option": f"OUT: {out_name} / IN: {in_name}",
+                "team_code": s.player_in.get("team_code"),
+                "player_out_team_code": s.player_out.get("team_code"),
+                "player_id_primary": s.player_in.get("id"),    # player_in FPL id (for gain tracking)
+                "player_id_secondary": s.player_out.get("id"), # player_out FPL id
             })
     except Exception:
         pass  # Non-fatal — transfer engine may fail during between-GW windows
@@ -529,6 +670,7 @@ async def get_priority_actions(
                 "recommended_option": (
                     f"Move {bench_p.web_name} to XI, {weakest_xi.web_name} to bench"
                 ),
+                "team_code": team_map[bench_p.team_id].code if bench_p.team_id in team_map else None,
             })
 
     # ── 5. Chip timing ────────────────────────────────────────────────────────
@@ -598,6 +740,200 @@ async def get_priority_actions(
             synthesized=synthesized_actions,
             label="priority_actions",
         )
+
+    # ── Auto-persist recommendations to decision_log (idempotent) ─────────────
+    # Each time the intel route is called we record every action as a pending
+    # decision (decision_followed=None). Cross-check later marks them
+    # followed/ignored. This means "ignored" decisions are captured automatically
+    # even when the user never clicks anything.
+    #
+    # Deduplication rules:
+    #   SINGLETON types (captain_pick, formation_change): only ONE entry per
+    #     (team, gw, decision_type). When the recommendation changes (e.g.,
+    #     captain switches from Thiago → Bruno), UPDATE the existing entry in
+    #     place and refresh created_at so the review page sees the latest pick.
+    #   All other types: one row per (team, gw, recommended_option) — multiple
+    #     transfer options each get their own row.
+    _SINGLETON_DT = {"captain_pick", "captain", "formation_change", "formation"}
+    try:
+        actions_to_log = payload["actions"]
+        now_ts = datetime.utcnow()
+        for action in actions_to_log:
+            dt = action.get("decision_type")
+            ro = action.get("recommended_option")
+            if not dt or not ro:
+                continue
+
+            dt_key = dt.lower().replace(" ", "_")
+            is_singleton = any(s in dt_key for s in _SINGLETON_DT)
+
+            if is_singleton:
+                # SINGLETON: only ONE captain_pick / formation_change row per (team, gw).
+                # Strategy: find all pending entries for this decision_type.
+                #   - DELETE any that DON'T match the current recommendation (stale).
+                #   - UPDATE the matching one (refresh created_at so review page
+                #     ordering stays correct), or INSERT if none found.
+                all_existing_res = await db.execute(
+                    select(DecisionLog).where(
+                        and_(
+                            DecisionLog.team_id == active_team_id,
+                            DecisionLog.gameweek_id == display_gw_id,
+                            DecisionLog.decision_type == dt,
+                            DecisionLog.resolved_at.is_(None),
+                        )
+                    )
+                )
+                all_existing = all_existing_res.scalars().all()
+
+                # Partition into: current recommendation entry vs stale entries
+                match = next((e for e in all_existing if e.recommended_option == ro), None)
+                stale  = [e for e in all_existing if e.recommended_option != ro and e.decision_followed is None]
+
+                # Delete stale entries (old recommendations superseded by new one)
+                for stale_entry in stale:
+                    await db.delete(stale_entry)
+
+                if match and match.decision_followed is None:
+                    # Refresh the matched entry so it sorts as newest
+                    match.expected_points = action.get("impact_value") or 0.0
+                    match.reasoning = action.get("reasoning")
+                    match.created_at = now_ts
+                    match.player_id_primary = action.get("player_id_primary")
+                    match.player_id_secondary = action.get("player_id_secondary")
+                elif not match:
+                    # No existing entry → insert fresh
+                    await db.flush()  # flush deletes before insert to avoid constraint races
+                    db.add(DecisionLog(
+                        team_id=active_team_id,
+                        gameweek_id=display_gw_id,
+                        decision_type=dt,
+                        recommended_option=ro,
+                        expected_points=action.get("impact_value") or 0.0,
+                        reasoning=action.get("reasoning"),
+                        created_at=now_ts,
+                        player_id_primary=action.get("player_id_primary"),
+                        player_id_secondary=action.get("player_id_secondary"),
+                    ))
+            else:
+                # NON-SINGLETON: one row per (team, gw, recommended_option).
+                #
+                # Skip standalone "Transfer out X" injury flags when a specific
+                # "OUT: X / IN: Y" recommendation already exists for the same player.
+                # This prevents double-logging: the specific transfer captures the action;
+                # the standalone flag is redundant noise.
+                primary_pid = action.get("player_id_primary")
+                if ro.startswith("Transfer out "):
+                    # Extract player name: "Transfer out James" → "James"
+                    player_name_flag = ro[len("Transfer out "):].strip()
+                    specific_res = await db.execute(
+                        select(DecisionLog).where(
+                            and_(
+                                DecisionLog.team_id == active_team_id,
+                                DecisionLog.gameweek_id == display_gw_id,
+                                DecisionLog.recommended_option.like(f"OUT: {player_name_flag} / IN: %"),
+                                DecisionLog.resolved_at.is_(None),
+                            )
+                        ).limit(1)
+                    )
+                    if specific_res.scalars().first():
+                        # Specific transfer exists for this player — delete any stale
+                        # standalone "Transfer out X" and skip creating a new one.
+                        stale_flag_res = await db.execute(
+                            select(DecisionLog).where(
+                                and_(
+                                    DecisionLog.team_id == active_team_id,
+                                    DecisionLog.gameweek_id == display_gw_id,
+                                    DecisionLog.recommended_option == ro,
+                                    DecisionLog.resolved_at.is_(None),
+                                )
+                            )
+                        )
+                        for stale_flag in stale_flag_res.scalars().all():
+                            if stale_flag.decision_followed is None:
+                                await db.delete(stale_flag)
+                        continue  # skip logging the standalone flag
+
+                # For "OUT: X / IN: Y" transfer decisions, deduplicate by the OUT player
+                # name extracted from recommended_option. Only one transfer recommendation
+                # per out-player per GW, keeping the most current one.
+                # (player_id_primary on these rows is the IN player, so dedup by name string.)
+                if ro.startswith("OUT:") and " / IN: " in ro:
+                    out_player_name = ro.split(" / IN: ")[0].replace("OUT: ", "").strip()
+                    # Find all existing OUT: <same-player> recommendations for this GW
+                    all_out_res = await db.execute(
+                        select(DecisionLog).where(
+                            and_(
+                                DecisionLog.team_id == active_team_id,
+                                DecisionLog.gameweek_id == display_gw_id,
+                                DecisionLog.recommended_option.like(f"OUT: {out_player_name} / IN: %"),
+                                DecisionLog.resolved_at.is_(None),
+                            )
+                        )
+                    )
+                    all_for_player = all_out_res.scalars().all()
+                    match = next((e for e in all_for_player if e.recommended_option == ro), None)
+                    stale = [e for e in all_for_player if e.recommended_option != ro and e.decision_followed is None]
+                    for stale_entry in stale:
+                        await db.delete(stale_entry)
+                    if match:
+                        if match.decision_followed is None:
+                            match.decision_type = dt
+                            match.expected_points = action.get("impact_value") or 0.0
+                            match.reasoning = action.get("reasoning")
+                            match.player_id_primary = primary_pid
+                            match.player_id_secondary = action.get("player_id_secondary")
+                    else:
+                        await db.flush()
+                        db.add(DecisionLog(
+                            team_id=active_team_id,
+                            gameweek_id=display_gw_id,
+                            decision_type=dt,
+                            recommended_option=ro,
+                            expected_points=action.get("impact_value") or 0.0,
+                            reasoning=action.get("reasoning"),
+                            created_at=now_ts,
+                            player_id_primary=primary_pid,
+                            player_id_secondary=action.get("player_id_secondary"),
+                        ))
+                    continue
+
+                existing_res = await db.execute(
+                    select(DecisionLog).where(
+                        and_(
+                            DecisionLog.team_id == active_team_id,
+                            DecisionLog.gameweek_id == display_gw_id,
+                            DecisionLog.recommended_option == ro,
+                            DecisionLog.resolved_at.is_(None),
+                        )
+                    ).limit(1)
+                )
+                existing = existing_res.scalars().first()
+
+                if existing:
+                    if existing.decision_followed is None:
+                        existing.decision_type = dt
+                        existing.expected_points = action.get("impact_value") or 0.0
+                        existing.reasoning = action.get("reasoning")
+                        existing.player_id_primary = action.get("player_id_primary")
+                        existing.player_id_secondary = action.get("player_id_secondary")
+                else:
+                    db.add(DecisionLog(
+                        team_id=active_team_id,
+                        gameweek_id=display_gw_id,
+                        decision_type=dt,
+                        recommended_option=ro,
+                        expected_points=action.get("impact_value") or 0.0,
+                        reasoning=action.get("reasoning"),
+                        created_at=now_ts,
+                        player_id_primary=action.get("player_id_primary"),
+                        player_id_secondary=action.get("player_id_secondary"),
+                    ))
+
+        await db.commit()
+    except Exception as _log_exc:
+        import logging as _logging
+        _logging.getLogger(__name__).warning(f"Intel: failed to auto-log decisions: {_log_exc}")
+
     return payload
 
 

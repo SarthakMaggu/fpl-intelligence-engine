@@ -11,7 +11,7 @@ from __future__ import annotations
 import asyncio
 import os
 from datetime import datetime, timezone
-from typing import List, Optional
+from typing import Any, List, Optional
 
 from fastapi import APIRouter, Header, HTTPException, Query
 from loguru import logger
@@ -70,6 +70,18 @@ async def get_model_metrics(
         result = await db.execute(query.order_by(BacktestModelMetrics.gw_id))
         rows = result.scalars().all()
 
+    import math as _m
+
+    def _f(v):
+        """Return float or None — never NaN/Inf."""
+        if v is None:
+            return None
+        try:
+            f = float(v)
+            return None if (_m.isnan(f) or _m.isinf(f)) else round(f, 4)
+        except (TypeError, ValueError):
+            return None
+
     versions = sorted({r.model_version for r in rows})
     return {
         "versions": versions,
@@ -77,10 +89,10 @@ async def get_model_metrics(
             {
                 "gw_id": r.gw_id,
                 "model_version": r.model_version,
-                "mae": r.mae,
-                "rmse": r.rmse,
-                "rank_corr": r.rank_corr,
-                "top_10_hit_rate": r.top_10_hit_rate,
+                "mae": _f(r.mae),
+                "rmse": _f(r.rmse),
+                "rank_corr": _f(r.rank_corr),
+                "top_10_hit_rate": _f(r.top_10_hit_rate),
             }
             for r in rows
         ],
@@ -125,13 +137,23 @@ async def get_strategy_metrics(
         )
         rows = result.scalars().all()
 
+    import math as _m2
+
+    def _sf(v):
+        if v is None: return None
+        try:
+            f = float(v)
+            return None if (_m2.isnan(f) or _m2.isinf(f)) else round(f, 2)
+        except (TypeError, ValueError):
+            return None
+
     output: dict = {s: [] for s in strategy_list}
     for r in rows:
         output.setdefault(r.strategy_name, []).append(
             {
                 "gw_id": r.gw_id,
-                "gw_points": r.gw_points,
-                "cumulative_points": r.cumulative_points,
+                "gw_points": _sf(r.gw_points),
+                "cumulative_points": _sf(r.cumulative_points),
             }
         )
     return {"season": season, "strategies": output}
@@ -257,12 +279,38 @@ async def get_performance_summary():
         return {"has_data": False, "is_computing": is_computing}
 
     # ── Aggregate model metrics by SEASON ───────────────────────────────────
-    season_stats: dict[str, dict] = defaultdict(
-        lambda: {"maes": [], "hit_rates": [], "rank_corrs": []}
-    )
+    # Deduplicate: for a given (season, gw_id), keep only the latest model version row
+    # This prevents duplicate rows from inflating average MAE when multiple model
+    # versions exist for the same GW.
+    # Priority: current > synthetic > historical (most recent/best model wins per GW)
+    _VERSION_PRIORITY = {"current": 3, "synthetic": 2, "historical": 1}
+    seen_gws: dict[tuple, Any] = {}
     for r in model_rows:
-        # Use the season column; fall back to model_version for legacy rows
         key = getattr(r, "season", None) or r.model_version
+        gw_key = (key, r.gw_id)
+        existing = seen_gws.get(gw_key)
+        if existing is None:
+            seen_gws[gw_key] = r
+        else:
+            # Keep whichever has higher version priority; tie-break by created_at
+            new_pri = _VERSION_PRIORITY.get(r.model_version, 0)
+            old_pri = _VERSION_PRIORITY.get(existing.model_version, 0)
+            if new_pri > old_pri:
+                seen_gws[gw_key] = r
+            elif new_pri == old_pri:
+                # Same version type — keep newer created_at
+                new_ts = getattr(r, "created_at", None)
+                old_ts = getattr(existing, "created_at", None)
+                if new_ts and old_ts and new_ts > old_ts:
+                    seen_gws[gw_key] = r
+    deduped_rows = list(seen_gws.values())
+
+    season_stats: dict[str, dict] = defaultdict(
+        lambda: {"maes": [], "hit_rates": [], "rank_corrs": [], "gw_ids": set()}
+    )
+    for r in deduped_rows:
+        key = getattr(r, "season", None) or r.model_version
+        season_stats[key]["gw_ids"].add(r.gw_id)
         season_stats[key]["maes"].append(r.mae)
         if r.top_10_hit_rate is not None:
             season_stats[key]["hit_rates"].append(r.top_10_hit_rate)
@@ -273,14 +321,17 @@ async def get_performance_summary():
     sorted_seasons = sorted(season_stats.keys())
 
     def _avg(lst: list) -> Optional[float]:
-        return round(sum(lst) / len(lst), 3) if lst else None
+        """Average, filtering out NaN/Inf so Starlette's strict JSON encoder never errors."""
+        import math
+        clean = [v for v in lst if v is not None and not math.isnan(v) and not math.isinf(v)]
+        return round(sum(clean) / len(clean), 3) if clean else None
 
     mae_by_season = [
         {
             "season": s,
             "avg_mae": _avg(season_stats[s]["maes"]),
             "avg_hit_rate": _avg(season_stats[s]["hit_rates"]),
-            "gw_count": len(season_stats[s]["maes"]),
+            "gw_count": len(season_stats[s]["gw_ids"]),  # unique GWs, not raw rows
         }
         for s in sorted_seasons
     ]
@@ -293,7 +344,7 @@ async def get_performance_summary():
     hit_first = _avg(season_stats[earliest]["hit_rates"])
     hit_last = _avg(season_stats[latest]["hit_rates"])
     rank_corr_last = _avg(season_stats[latest]["rank_corrs"])
-    total_gws = len(model_rows)  # total GW evaluations across all seasons
+    total_gws = sum(len(season_stats[s]["gw_ids"]) for s in sorted_seasons)  # unique GWs per season, summed
 
     # Need data from at least 2 seasons with MAE improvement to show trend
     has_meaningful_trend = (
@@ -306,24 +357,57 @@ async def get_performance_summary():
         mae_first = None  # frontend hides "from → to" arrow when this is None
         hit_first = None
 
-    # ── Strategy advantage (across all seasons, per-GW mean) ────────────────
+    # ── Strategy advantage (across completed seasons only, per-GW mean) ────────
+    # Use greedy_xpts vs baseline — the most interpretable comparison.
+    # Only include GWs where strategies actually differ (excludes incomplete seasons
+    # where all strategies produce identical placeholder values).
     strategy_advantage_per_gw = None
     strategy_gw_count = 0
 
-    bandit_rows = [r for r in strat_rows if r.strategy_name == "bandit_ilp"]
+    greedy_rows = [r for r in strat_rows if r.strategy_name == "greedy_xpts"]
     baseline_rows = [r for r in strat_rows if r.strategy_name == "baseline_no_transfer"]
 
-    if bandit_rows and baseline_rows:
-        # Key by (season, gw_id) for cross-season alignment
+    import math as _math
+
+    if greedy_rows and baseline_rows:
         baseline_map = {(r.season, r.gw_id): r.gw_points for r in baseline_rows}
         advantages = [
             r.gw_points - baseline_map[(r.season, r.gw_id)]
-            for r in bandit_rows
+            for r in greedy_rows
             if (r.season, r.gw_id) in baseline_map
+            and r.gw_points is not None
+            and baseline_map.get((r.season, r.gw_id)) is not None
+            # Only count GWs where strategies actually diverged (non-identical)
+            and r.gw_points != baseline_map[(r.season, r.gw_id)]
         ]
+        advantages = [v for v in advantages if not _math.isnan(v) and not _math.isinf(v)]
         if advantages:
             strategy_advantage_per_gw = round(sum(advantages) / len(advantages), 1)
             strategy_gw_count = len(advantages)
+
+    import math as _math
+
+    def _n(v):
+        """Return None if float is NaN/Inf, else v unchanged."""
+        if v is None:
+            return None
+        try:
+            if _math.isnan(v) or _math.isinf(v):
+                return None
+        except (TypeError, ValueError):
+            pass
+        return v
+
+    # Sanitize mae_by_season entries
+    mae_by_season = [
+        {
+            "season": s["season"],
+            "avg_mae": _n(s["avg_mae"]),
+            "avg_hit_rate": _n(s.get("avg_hit_rate")),
+            "gw_count": s["gw_count"],
+        }
+        for s in mae_by_season
+    ]
 
     return {
         "has_data": True,
@@ -333,12 +417,12 @@ async def get_performance_summary():
         "seasons": sorted_seasons,
         "earliest_season": earliest,
         "latest_season": latest,
-        "mae_first": mae_first,
-        "mae_last": mae_last,
-        "hit_rate_first": hit_first,
-        "hit_rate_last": hit_last,
-        "rank_corr_last": rank_corr_last,
-        "strategy_advantage_per_gw": strategy_advantage_per_gw,
+        "mae_first": _n(mae_first),
+        "mae_last": _n(mae_last),
+        "hit_rate_first": _n(hit_first),
+        "hit_rate_last": _n(hit_last),
+        "rank_corr_last": _n(rank_corr_last),
+        "strategy_advantage_per_gw": _n(strategy_advantage_per_gw),
         "strategy_gw_count": strategy_gw_count,
         "mae_by_season": mae_by_season,
         # Keep backwards-compatible field for existing frontend sparkline code

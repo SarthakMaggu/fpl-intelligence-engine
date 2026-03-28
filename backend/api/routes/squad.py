@@ -194,9 +194,19 @@ async def sync_squad(
         # Populate injury/suspension news alerts from BBC Sport RSS + Reddit
         # into Redis so transfer suggestions can surface relevant warnings.
         background_tasks.add_task(_run_news_background)
+        # Invalidate transfer suggestions cache so next page load recomputes
+        # with the freshly synced squad data.
+        # Invalidate transfer suggestions cache so next page load recomputes
+        # with the freshly synced squad data.
+        try:
+            from core.redis_client import redis_client as _rc
+            _keys = await _rc.keys(f"transfers:suggestions:{active_team_id}:*")
+            if _keys:
+                await _rc.delete(*_keys)
+        except Exception:
+            pass  # Non-fatal — cache will expire naturally in 45 min
         return {"status": "queued", "message": "Syncing squad from FPL API...", "job_id": job["job_id"]}
     except PipelineRunningError as e:
-        from fastapi import Response
         return {"status": "already_running", "message": str(e)}
 
 

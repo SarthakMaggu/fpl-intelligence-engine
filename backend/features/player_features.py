@@ -62,8 +62,8 @@ async def build_features_for_gw(
             "selected_by_percent": float(p.selected_by_percent or 0.0),
             "ownership": float(p.selected_by_percent or 0.0),
             "predicted_xpts_next": float(p.predicted_xpts_next or 0.0),
-            "xg_per_90": float(p.expected_goals_per_90 or 0.0),
-            "xa_per_90": float(p.expected_assists_per_90 or 0.0),
+            "xg_per_90": float(p.xg_per_90 or 0.0),
+            "xa_per_90": float(p.xa_per_90 or 0.0),
             "rolling_xg": 0.0,
             "rolling_xa": 0.0,
             "shots": float(p.threat or 0.0),
@@ -73,7 +73,7 @@ async def build_features_for_gw(
             "fixture_difficulty": float(p.fdr_next or 3.0),
             "home_away": 1 if p.is_home_next else 0,
             "ict_index": float(p.ict_index or 0.0),
-            "transfers_in_event_delta": float(p.transfers_in_event or 0),
+            "transfers_in_event_delta": float(p.transfers_in_event or 0) - float(p.transfers_out_event or 0),
             "suspension_risk": float(p.suspension_risk or 0.0),
             "rotation_risk": 0.0,
             # Explicit None check: `(0 or 100)` = 100 in Python, treating 0%-fit
@@ -108,7 +108,7 @@ async def build_features_for_gw(
     try:
         rolling_sql = text("""
             SELECT
-                element,
+                player_id,
                 SUM(expected_goals)   AS xg_last_5,
                 SUM(expected_assists) AS xa_last_5,
                 SUM(goals_scored)     AS goals_last_5,
@@ -117,16 +117,16 @@ async def build_features_for_gw(
                 AVG(minutes)          AS avg_minutes_last_5
             FROM (
                 SELECT *,
-                    ROW_NUMBER() OVER (PARTITION BY element ORDER BY event DESC) AS rn
+                    ROW_NUMBER() OVER (PARTITION BY player_id ORDER BY gw_id DESC) AS rn
                 FROM player_gw_history
-                WHERE event < :gw_id
+                WHERE gw_id < :gw_id
             ) ranked
             WHERE rn <= 5
-            GROUP BY element
+            GROUP BY player_id
         """)
         rolling_res = await db.execute(rolling_sql, {"gw_id": gw_id})
         for row in rolling_res.mappings():
-            pid = row["element"]
+            pid = row["player_id"]
             if pid in features:
                 features[pid]["xg_last_5_gws"] = float(row["xg_last_5"] or 0.0)
                 features[pid]["xa_last_5_gws"] = float(row["xa_last_5"] or 0.0)
@@ -193,10 +193,108 @@ async def build_features_for_gw(
     except Exception as e:
         logger.warning(f"[feature_store] Competition fixture congestion lookup failed: {e}")
 
-    # ── 5. Add gw_id to each feature dict ────────────────────────────────────
+    # ── 5. Forward-looking fixture features (Phase 3) ────────────────────────
+    # fdr_next3_avg, opponent_goals_conceded_per90, season_stage, days_since_last_game
+    try:
+        from models.db.fixture import Fixture
+        from models.db.gameweek import Gameweek
+        from models.db.history import PlayerGWHistory
+        from sqlalchemy import func as _func
+
+        # season_stage: normalise gw_id to [0, 1]
+        season_stage = round(min(max((gw_id - 1) / 37.0, 0.0), 1.0), 4)
+
+        # Load next 3 GW fixtures for each team
+        # gw_id param is the GW being predicted — fixtures are GW gw_id through gw_id+2
+        fdr_res = await db.execute(
+            select(Fixture.team_home_id, Fixture.team_away_id, Fixture.team_h_difficulty, Fixture.team_a_difficulty, Fixture.gameweek_id)
+            .where(
+                Fixture.gameweek_id >= gw_id,
+                Fixture.gameweek_id <= gw_id + 2,
+                Fixture.gameweek_id.isnot(None),
+            )
+        )
+        fdr_rows = fdr_res.fetchall()
+
+        # Build per-team: list of FDRs for next 3 GWs (as home or away)
+        team_fdrs: dict[int, list[float]] = {}
+        for row in fdr_rows:
+            if row.team_home_id:
+                team_fdrs.setdefault(row.team_home_id, []).append(float(row.team_h_difficulty or 3))
+            if row.team_away_id:
+                team_fdrs.setdefault(row.team_away_id, []).append(float(row.team_a_difficulty or 3))
+
+        # Per-team: goals conceded in last 10 GWs (proxy for defensive strength vs)
+        # Use team as the opposition — look at how many goals this team SCORED against the player's opponent
+        team_goals_conceded: dict[int, float] = {}
+        conc_res = await db.execute(text("""
+            SELECT team_id, AVG(total_goals_conceded) AS avg_gc
+            FROM (
+                SELECT
+                    CASE WHEN f.team_home_id = pgh.team_id THEN f.team_away_id
+                         ELSE f.team_home_id END AS team_id,
+                    (f.team_h_score + f.team_a_score -
+                     CASE WHEN f.team_home_id = pgh.team_id THEN f.team_h_score
+                          ELSE f.team_a_score END) AS total_goals_conceded
+                FROM player_gw_history pgh
+                JOIN fixtures f ON (f.team_home_id = pgh.team_id OR f.team_away_id = pgh.team_id)
+                    AND f.gameweek_id = pgh.gw_id
+                    AND f.team_h_score IS NOT NULL
+                WHERE pgh.gw_id >= :min_gw AND pgh.gw_id < :max_gw
+            ) sub
+            GROUP BY team_id
+        """), {"min_gw": max(1, gw_id - 10), "max_gw": gw_id})
+        for row in conc_res.mappings():
+            if row["team_id"] and row["avg_gc"] is not None:
+                team_goals_conceded[int(row["team_id"])] = round(float(row["avg_gc"]), 3)
+
+        # Days since last game — use gw_id gap in player_gw_history
+        last_game_res = await db.execute(text("""
+            SELECT player_id, MAX(gw_id) AS last_gw
+            FROM player_gw_history
+            WHERE gw_id < :gw_id AND minutes > 0
+            GROUP BY player_id
+        """), {"gw_id": gw_id})
+        player_last_gw: dict[int, int] = {int(r["player_id"]): int(r["last_gw"]) for r in last_game_res.mappings()}
+
+        for pid, feat in features.items():
+            tid = int(feat.get("team_id", 0) or 0)
+            # fdr_next3_avg
+            fdrs = team_fdrs.get(tid, [float(feat.get("fixture_difficulty", 3.0))])
+            feat["fdr_next3_avg"] = round(sum(fdrs) / len(fdrs), 3) if fdrs else 3.0
+            # opponent_goals_conceded_per90 (the opposition team's defensive record)
+            opp_id = feat.get("opponent_team_id")  # may be None if not set
+            feat["opponent_goals_conceded_per90"] = team_goals_conceded.get(opp_id or 0, 1.3)
+            # season_stage
+            feat["season_stage"] = season_stage
+            # days_since_last_game — approximate: (gw_id - last_gw) × 7 days
+            last_gw = player_last_gw.get(pid)
+            feat["days_since_last_game"] = int((gw_id - last_gw) * 7) if last_gw else 14
+    except Exception as e:
+        logger.warning(f"[feature_store] Phase-3 fixture features failed (non-fatal): {e}")
+        # Fill safe defaults so feature vector is complete
+        for feat in features.values():
+            feat.setdefault("fdr_next3_avg", float(feat.get("fixture_difficulty", 3.0)))
+            feat.setdefault("opponent_goals_conceded_per90", 1.3)
+            feat.setdefault("season_stage", round(min(max((gw_id - 1) / 37.0, 0.0), 1.0), 4))
+            feat.setdefault("days_since_last_game", 7)
+
+    # ── 6. Add gw_id to each feature dict ────────────────────────────────────
     for feat in features.values():
         feat["gw_id"] = gw_id
         feat["rotation_risk"] = float(feat.get("rotation_risk_score", feat.get("rotation_risk", 0.0)) or 0.0)
+
+    # ── Normalize transfers_in_event_delta by total GW volume ────────────────
+    # Raw FPL counts (e.g. 107,339 for Bruno after a haul) caused the model to
+    # learn a "regression after massive bandwagon buying" pattern that overcrowded
+    # all other form signals.  Converting to a percentage-of-market-activity
+    # signal keeps the semantics (positive = net bought) but bounds the magnitude.
+    _total_ti = sum(
+        max(float(f.get("transfers_in_event_delta", 0)), 0.0) for f in features.values()
+    ) or 1.0
+    for feat in features.values():
+        raw_delta = float(feat.get("transfers_in_event_delta", 0.0) or 0.0)
+        feat["transfers_in_event_delta"] = max(-10.0, min(10.0, raw_delta / _total_ti * 100))
 
     logger.info(
         f"[feature_store] Built features for GW{gw_id}: {len(features)} players"
@@ -217,7 +315,7 @@ async def update_latest_features(
     if not features:
         return
 
-    now = datetime.now(timezone.utc)
+    now = datetime.utcnow()  # Use naive UTC — DB columns use server_default=func.now() (naive)
     batch_size = 100
 
     player_ids = list(features.keys())
@@ -250,12 +348,19 @@ async def update_latest_features(
             await db.execute(latest_stmt)
 
             # Insert into player_features_history (skip if already exists for this GW + season)
+            # Derive season dynamically: season starts in August each year.
+            _now = datetime.now(timezone.utc)
+            _current_season = (
+                f"{_now.year}-{str(_now.year + 1)[-2:]}"
+                if _now.month >= 8
+                else f"{_now.year - 1}-{str(_now.year)[-2:]}"
+            )
             history_stmt = (
                 pg_insert(PlayerFeaturesHistory)
                 .values(
                     player_id=pid,
                     gw_id=gw_id,
-                    season="2024-25",   # current season — historical seasons use historical_backfill
+                    season=_current_season,
                     features_json=feat,
                     created_at=now,
                 )

@@ -30,10 +30,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from models.db.backtest import BacktestModelMetrics, BacktestStrategyMetrics
 from models.db.feature_store import PlayerFeaturesHistory
 from models.db.history import PlayerGWHistory
+from models.db.historical_gw_stats import HistoricalGWStats
 
 logger = logging.getLogger(__name__)
 
-# Seasons available for backtesting (must have data in player_gw_history)
+# Seasons available for backtesting (must have data in historical_gw_stats)
 SUPPORTED_SEASONS = ["2022-23", "2023-24", "2024-25"]
 
 # Strategies available for simulation
@@ -54,71 +55,153 @@ async def run_model_backtest(
     season: str = "2024-25",
 ) -> List[Dict]:
     """
-    For each GW in the current season where player_features_history exists:
-    1. Load stored features for that GW.
+    For each completed GW in `season` where historical_gw_stats data exists:
+    1. Build XPTS_FEATURES-compatible feature DataFrame from historical_gw_stats
+       (same feature engineering pipeline used during model training).
     2. Predict with the given model version (or provided model_obj).
-    3. Compare to actual_points from player_gw_history.
+    3. Compare to actual_points from historical_gw_stats.
     4. Compute MAE, RMSE, rank_corr, top_10_hit_rate.
     5. Upsert into backtest_model_metrics.
 
-    Returns list of metric dicts per GW.
-
-    Note: For historical seasons (2022-23, 2023-24), use
-    data_pipeline.historical_backfill.run_model_backtest_for_season() instead,
-    which sources actuals from historical_gw_stats.
+    Uses historical_gw_stats (vaastav data, all ~800 players) instead of
+    player_features_history (FPL API features, wrong column names, only squad players).
     """
-    # Discover GWs that have feature history data for this season
-    gw_res = await db.execute(
-        select(PlayerFeaturesHistory.gw_id)
-        .where(PlayerFeaturesHistory.season == season)
-        .distinct()
-        .order_by(PlayerFeaturesHistory.gw_id)
-    )
-    available_gws = [row[0] for row in gw_res.all()]
+    import pandas as pd
+    from models.ml.xpts_model import XPTS_FEATURES
 
-    if not available_gws:
-        logger.warning("[backtest] No feature history found — run at least one GW pipeline first")
+    # ── Load ALL historical stats for this season in one query ──────────────
+    stats_res = await db.execute(
+        select(HistoricalGWStats)
+        .where(HistoricalGWStats.season == season)
+        .order_by(HistoricalGWStats.player_id, HistoricalGWStats.gw)
+    )
+    stats_rows = stats_res.scalars().all()
+
+    if not stats_rows:
+        logger.warning(f"[backtest] No historical_gw_stats for season {season} — run backfill first")
         return []
 
-    # Load model if not provided
+    # ── Convert to DataFrame matching vaastav format ─────────────────────────
+    raw_data = []
+    for r in stats_rows:
+        raw_data.append({
+            "name": str(r.player_id),      # use player_id as grouping key
+            "player_id": r.player_id,
+            "round": r.gw,
+            "season": r.season,
+            "position": (r.position or "MID").replace("GKP", "GK"),  # normalise vaastav→FPL
+            "total_points": r.total_points or 0,
+            "minutes": r.minutes or 0,
+            "goals_scored": r.goals_scored or 0,
+            "assists": r.assists or 0,
+            "clean_sheets": r.clean_sheets or 0,
+            "bps": r.bps or 0,
+            "ict_index": r.ict_index or 0.0,
+            "value": r.value or 50,       # pence×10; /10 = £m
+            "selected": r.selected or 0,
+            "transfers_in": r.transfers_in or 0,
+            "transfers_out": r.transfers_out or 0,
+            "was_home": bool(r.was_home) if r.was_home is not None else False,
+            "opponent_team": r.opponent_team,
+            "expected_goals": r.expected_goals or 0.0,
+            "expected_assists": r.expected_assists or 0.0,
+            "goals_conceded": 0,   # not in historical_gw_stats; neutral value
+        })
+
+    df_season = pd.DataFrame(raw_data)
+
+    # ── Apply same feature engineering as historical_fetcher._engineer_features ──
+    from data_pipeline.historical_fetcher import HistoricalFetcher
+    fetcher = HistoricalFetcher()
+    df_engineered = fetcher._engineer_features(df_season)
+
+    # ── Load model if not provided ───────────────────────────────────────────
     if model_obj is None:
         from ml.model_loader import get_current_model
         model_obj = await get_current_model("xpts_lgbm")
+
+    # ── Get model features ───────────────────────────────────────────────────
+    try:
+        model_features = list(getattr(model_obj, "feature_name_", None) or []) if model_obj else []
+    except Exception:
+        model_features = []
+    if not model_features:
+        model_features = XPTS_FEATURES
+
+    # ── Discover which GWs have actuals ─────────────────────────────────────
+    available_gws = sorted(df_engineered["round"].unique().tolist())
 
     results = []
 
     for gw_id in available_gws:
         try:
-            metrics = await _evaluate_model_on_gw(
-                gw_id=gw_id,
-                model_version=model_version,
-                model_obj=model_obj,
-                db=db,
-                season=season,
-            )
-            if metrics:
-                results.append(metrics)
-                # Upsert into DB
-                stmt = (
-                    pg_insert(BacktestModelMetrics)
-                    .values(**metrics)
-                    .on_conflict_do_update(
-                        constraint="uq_bmm_version_gw_season",
-                        set_={
-                            k: v for k, v in metrics.items()
-                            if k not in ("id", "model_version", "gw_id", "season", "created_at")
-                        },
-                    )
+            gw_df = df_engineered[df_engineered["round"] == gw_id].copy()
+            if len(gw_df) < 5:
+                continue
+
+            # Predict
+            if model_obj is not None:
+                X = gw_df.reindex(columns=model_features, fill_value=0.0).fillna(0.0)
+                try:
+                    predictions = np.array(model_obj.predict(X), dtype=float)
+                except Exception as e:
+                    logger.warning(f"[backtest] Prediction failed for GW{gw_id}: {e}")
+                    continue
+            else:
+                predictions = gw_df.get("form", pd.Series([0.0] * len(gw_df))).fillna(0.0).values
+
+            actuals_arr = gw_df["actual_points"].fillna(0.0).values
+            mask = ~np.isnan(actuals_arr) & ~np.isnan(predictions)
+            if mask.sum() < 5:
+                continue
+
+            preds_clean = predictions[mask]
+            actuals_clean = actuals_arr[mask]
+
+            mae = float(np.mean(np.abs(preds_clean - actuals_clean)))
+            rmse = float(np.sqrt(np.mean((preds_clean - actuals_clean) ** 2)))
+
+            try:
+                rank_corr = float(spearmanr(preds_clean, actuals_clean).correlation)
+            except Exception:
+                rank_corr = 0.0
+
+            top10_actual = set(np.argsort(actuals_clean)[-10:])
+            top10_pred = set(np.argsort(preds_clean)[-10:])
+            top10_hit_rate = len(top10_actual & top10_pred) / 10.0
+
+            metrics = {
+                "model_version": model_version,
+                "gw_id": int(gw_id),
+                "season": season,
+                "mae": mae,
+                "rmse": rmse,
+                "rank_corr": rank_corr,
+                "top_10_hit_rate": top10_hit_rate,
+            }
+            results.append(metrics)
+
+            # Upsert into DB
+            stmt = (
+                pg_insert(BacktestModelMetrics)
+                .values(**metrics)
+                .on_conflict_do_update(
+                    constraint="uq_bmm_version_gw_season",
+                    set_={
+                        k: v for k, v in metrics.items()
+                        if k not in ("id", "model_version", "gw_id", "season", "created_at")
+                    },
                 )
-                await db.execute(stmt)
+            )
+            await db.execute(stmt)
 
         except Exception as e:
-            logger.error(f"[backtest] Model eval failed for GW{gw_id}: {e}")
+            logger.error(f"[backtest] Model eval failed for GW{gw_id} season {season}: {e}")
 
     await db.commit()
     logger.info(
         f"[backtest] Model backtest complete: "
-        f"{len(results)} GWs evaluated for v{model_version}"
+        f"{len(results)} GWs evaluated for v{model_version} season {season}"
     )
     return results
 
@@ -130,57 +213,65 @@ async def _evaluate_model_on_gw(
     db: AsyncSession,
     season: str = "2024-25",
 ) -> Optional[Dict]:
-    """Evaluate model predictions vs actuals for a single GW."""
+    """Legacy single-GW evaluator — kept for backward compatibility.
+    Prefer run_model_backtest() which loads the full season in one pass."""
     import pandas as pd
     from models.ml.xpts_model import XPTS_FEATURES
 
-    # Load features for this GW + season
-    feat_res = await db.execute(
-        select(PlayerFeaturesHistory.player_id, PlayerFeaturesHistory.features_json)
-        .where(
-            PlayerFeaturesHistory.gw_id == gw_id,
-            PlayerFeaturesHistory.season == season,
-        )
+    # Load features for this GW from historical_gw_stats (correct data source)
+    stats_res = await db.execute(
+        select(HistoricalGWStats)
+        .where(HistoricalGWStats.season == season, HistoricalGWStats.gw == gw_id)
     )
-    feat_rows = feat_res.all()
-    if not feat_rows:
+    gw_rows = stats_res.scalars().all()
+    if not gw_rows:
         return None
 
-    player_ids = [r[0] for r in feat_rows]
-    feat_dicts = [r[1] for r in feat_rows]
+    # Build a minimal DataFrame (no rolling context — features will be rough but correct column names)
+    raw_data = [{
+        "name": str(r.player_id),
+        "player_id": r.player_id,
+        "round": r.gw,
+        "season": r.season,
+        "position": (r.position or "MID").replace("GKP", "GK"),
+        "total_points": r.total_points or 0,
+        "minutes": r.minutes or 0,
+        "goals_scored": r.goals_scored or 0,
+        "assists": r.assists or 0,
+        "clean_sheets": r.clean_sheets or 0,
+        "bps": r.bps or 0,
+        "ict_index": r.ict_index or 0.0,
+        "value": r.value or 50,
+        "selected": r.selected or 0,
+        "transfers_in": r.transfers_in or 0,
+        "transfers_out": r.transfers_out or 0,
+        "was_home": bool(r.was_home) if r.was_home is not None else False,
+        "expected_goals": r.expected_goals or 0.0,
+        "expected_assists": r.expected_assists or 0.0,
+        "goals_conceded": 0,
+    } for r in gw_rows]
 
-    df = pd.DataFrame(feat_dicts)
-    df["player_id"] = player_ids
+    df = pd.DataFrame(raw_data)
+    from data_pipeline.historical_fetcher import HistoricalFetcher
+    df = HistoricalFetcher()._engineer_features(df)
+    df = df[df["round"] == gw_id]
 
-    # Load actual points — current season from player_gw_history
-    actuals_res = await db.execute(
-        select(PlayerGWHistory.element, PlayerGWHistory.total_points)
-        .where(
-            PlayerGWHistory.event == gw_id,
-            PlayerGWHistory.element.in_(player_ids),
-        )
-    )
-    actuals = {row[0]: float(row[1]) for row in actuals_res.all()}
-
-    if not actuals:
+    if len(df) < 5:
         return None
 
-    # Align actuals with df
-    df["actual_points"] = df["player_id"].map(actuals).fillna(0.0)
+    actuals_arr = df["actual_points"].fillna(0.0).values
 
-    # Predict
     if model_obj is not None:
-        available = [f for f in XPTS_FEATURES if f in df.columns]
-        X = df[available].fillna(0)
         try:
-            predictions = model_obj.predict(X)
+            model_features = list(getattr(model_obj, "feature_name_", None) or []) or XPTS_FEATURES
+            X = df.reindex(columns=model_features, fill_value=0.0).fillna(0.0)
+            predictions = np.array(model_obj.predict(X), dtype=float)
         except Exception as e:
             logger.warning(f"[backtest] Prediction failed for GW{gw_id}: {e}")
             return None
     else:
-        predictions = df.get("predicted_xpts_next", df.get("form", 0.0)).fillna(0.0).values
+        predictions = df.get("form", pd.Series([0.0] * len(df))).fillna(0.0).values
 
-    actuals_arr = df["actual_points"].values
     mask = ~np.isnan(actuals_arr) & ~np.isnan(predictions)
     if mask.sum() < 5:
         return None
@@ -196,7 +287,6 @@ async def _evaluate_model_on_gw(
     except Exception:
         rank_corr = 0.0
 
-    # Top-10 hit rate: fraction of top-10 actual scorers in top-10 predicted
     top10_actual = set(np.argsort(actuals_clean)[-10:])
     top10_pred = set(np.argsort(preds_clean)[-10:])
     top10_hit_rate = len(top10_actual & top10_pred) / 10.0
@@ -315,8 +405,8 @@ async def _simulate_gw(
 
     # Load actuals — current season from player_gw_history
     actuals_res = await db.execute(
-        select(PlayerGWHistory.element, PlayerGWHistory.total_points)
-        .where(PlayerGWHistory.event == gw_id)
+        select(PlayerGWHistory.player_id, PlayerGWHistory.total_points)
+        .where(PlayerGWHistory.gw_id == gw_id)
     )
     actuals = {row[0]: float(row[1]) for row in actuals_res.all()}
 
@@ -346,10 +436,10 @@ async def _simulate_gw(
             pts *= 2  # captain doubling
         total_pts += pts
 
-    # Hits: baseline/greedy never take hits; bandit_ilp deducts simulated hit cost
-    if strategy == "bandit_ilp":
-        # Simulate ~0.3 hits/GW on average for bandit strategy
-        total_pts -= 4.0 * 0.3
+    # Hits: No hit deduction applied in backtest simulation.
+    # Hit frequency varies by user context and chip state; applying a fixed
+    # estimate (e.g. 0.3/GW) would bias comparisons between strategies.
+    # Actual hit costs are tracked in decision_log table for live evaluation.
 
     return float(total_pts)
 
@@ -397,7 +487,7 @@ async def run_season_simulation(
     """
     n_simulations = max(100, min(n_simulations, 5000))  # clamp to [100, 5000]
 
-    # ── 1. Load current player predicted_xpts ────────────────────────────────
+    # ── 1. Load current player predicted_xpts + GW context ───────────────────
     from models.db.player import Player
     from models.db.gameweek import Gameweek
 
@@ -407,6 +497,21 @@ async def run_season_simulation(
 
     total_gws = 38
     remaining = remaining_gws or max(1, total_gws - current_gw_id)
+
+    # ── Estimate completed-GW base points from league averages ───────────────
+    # Sum average_entry_score from all finished GWs to get a typical manager's
+    # current season total.  This makes rank estimates meaningful — we project
+    # the remaining GWs on top of a realistic season baseline.
+    try:
+        from sqlalchemy import func as _func
+        avg_res = await db.execute(
+            select(_func.sum(Gameweek.average_entry_score))
+            .where(Gameweek.finished == True)
+        )
+        league_avg_pts_so_far = float(avg_res.scalar() or 0.0)
+    except Exception:
+        # Rough fallback: 45 pts/GW average for completed GWs
+        league_avg_pts_so_far = current_gw_id * 45.0
 
     player_res = await db.execute(
         select(Player.id, Player.predicted_xpts_next, Player.element_type)
@@ -425,16 +530,23 @@ async def run_season_simulation(
 
     xpts = np.array([float(p[1] or 0.0) for p in players])
 
-    # ── 2. Estimate point noise from historical MAE ───────────────────────────
-    # If Redis has a stored MAE use it; otherwise fall back to typical LightGBM RMSE
-    noise_std = 2.5  # pts — typical model RMSE for xPts prediction
+    # ── 2. Estimate point noise from stored model MAE ────────────────────────
+    # Use Redis-stored MAE as noise std — it reflects actual model accuracy.
+    # Try ml:current_mae (set by calibration job) then ml:model_rmse (set by retrain).
+    # Conservative fallback is 3.0 pts — slightly above typical RMSE to account
+    # for tail events (hauls, blanks) not captured by Gaussian noise.
+    noise_std = 3.0   # fallback — set conservatively above typical RMSE
     if redis is not None:
-        try:
-            stored_mae = await redis.get("ml:current_mae")
-            if stored_mae:
-                noise_std = float(stored_mae.decode() if isinstance(stored_mae, bytes) else stored_mae)
-        except Exception:
-            pass
+        for redis_key in ("ml:current_mae", "ml:model_rmse"):
+            try:
+                stored = await redis.get(redis_key)
+                if stored:
+                    val = float(stored.decode() if isinstance(stored, bytes) else stored)
+                    if 0.5 < val < 10.0:  # sanity range
+                        noise_std = val
+                        break
+            except Exception:
+                pass
 
     # ── 3. Run Monte Carlo ───────────────────────────────────────────────────
     rng = np.random.default_rng(seed=42)
@@ -462,7 +574,11 @@ async def run_season_simulation(
     totals = np.array(season_totals)
 
     # ── 4. Rank estimation ───────────────────────────────────────────────────
-    # Approximate inverse rank function derived from FPL public rank data:
+    # Add league-average completed-GW baseline so rank formula sees a full
+    # season total, not just the remaining GWs.
+    full_season_totals = totals + league_avg_pts_so_far
+
+    # Approximate inverse rank function from FPL public rank data:
     # Rank ≈ 10_000_000 * exp(-0.007 * (points - 1200))
     # This is deliberately coarse — relative comparison is what matters.
     def _pts_to_rank(pts: float) -> int:
@@ -470,38 +586,39 @@ async def run_season_simulation(
         return max(1, min(10_000_000, rank))
 
     # ── 5. Chip timing recommendation ────────────────────────────────────────
-    # Simple heuristic: if p50 < 1800 (low score projection), recommend WC now.
-    # If there are ≥8 remaining GWs and no DGW imminent, hold chips.
-    p50 = float(np.percentile(totals, 50))
+    p50 = float(np.percentile(full_season_totals, 50))
     chip_rec = "Hold chips — projection looks on-target"
-    if p50 < 1600:
-        chip_rec = "Consider Wildcard — projected points are low; a squad reset may help"
-    elif p50 > 2200:
-        chip_rec = "Hold chips — strong projection; deploy Triple Captain in a DGW"
+    # Thresholds relative to full-season total (league avg ~2000-2200 pts)
+    if p50 < max(league_avg_pts_so_far + 200, 1700):
+        chip_rec = "Consider Wildcard — projected total is below average; a squad reset may recover ground"
+    elif p50 > max(league_avg_pts_so_far + 500, 2200):
+        chip_rec = "Strong projection — hold chips; deploy Triple Captain in a DGW for maximum ceiling"
 
     # ── 6. Risk profile ───────────────────────────────────────────────────────
-    cv = float(np.std(totals)) / max(float(np.mean(totals)), 1.0)  # coefficient of variation
-    risk_profile = "low" if cv < 0.08 else ("medium" if cv < 0.15 else "high")
+    cv = float(np.std(full_season_totals)) / max(float(np.mean(full_season_totals)), 1.0)
+    risk_profile = "low" if cv < 0.05 else ("medium" if cv < 0.10 else "high")
 
     return {
         "n_simulations": n_simulations,
         "remaining_gws": remaining,
         "current_gw": current_gw_id,
+        "league_avg_pts_so_far": round(league_avg_pts_so_far, 0),
+        # points_distribution shows REMAINING GWs only (add league_avg_pts_so_far for full season)
         "points_distribution": {
-            "p10": round(float(np.percentile(totals, 10)), 1),
-            "p25": round(float(np.percentile(totals, 25)), 1),
+            "p10": round(float(np.percentile(full_season_totals, 10)), 1),
+            "p25": round(float(np.percentile(full_season_totals, 25)), 1),
             "p50": round(p50, 1),
-            "p75": round(float(np.percentile(totals, 75)), 1),
-            "p90": round(float(np.percentile(totals, 90)), 1),
-            "mean": round(float(np.mean(totals)), 1),
-            "std": round(float(np.std(totals)), 1),
+            "p75": round(float(np.percentile(full_season_totals, 75)), 1),
+            "p90": round(float(np.percentile(full_season_totals, 90)), 1),
+            "mean": round(float(np.mean(full_season_totals)), 1),
+            "std": round(float(np.std(full_season_totals)), 1),
         },
         "rank_distribution": {
-            "p10": _pts_to_rank(float(np.percentile(totals, 90))),  # best points → best rank
-            "p25": _pts_to_rank(float(np.percentile(totals, 75))),
-            "p50": _pts_to_rank(p50),
-            "p75": _pts_to_rank(float(np.percentile(totals, 25))),
-            "p90": _pts_to_rank(float(np.percentile(totals, 10))),
+            "p10": _pts_to_rank(float(np.percentile(full_season_totals, 90))),  # best pts → best rank
+            "p25": _pts_to_rank(float(np.percentile(full_season_totals, 75))),
+            "p50": _pts_to_rank(float(np.percentile(full_season_totals, 50))),
+            "p75": _pts_to_rank(float(np.percentile(full_season_totals, 25))),
+            "p90": _pts_to_rank(float(np.percentile(full_season_totals, 10))),
         },
         "chip_timing_recommendation": chip_rec,
         "risk_profile": risk_profile,

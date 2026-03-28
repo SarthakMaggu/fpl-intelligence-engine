@@ -97,8 +97,15 @@ def _load_handler(job_type: str) -> Callable[[dict[str, Any]], Awaitable[dict[st
 
 async def run_worker_loop() -> None:
     logger.info("Starting Redis job worker loop")
+    _hb_counter = 0
     while True:
         try:
+            # Write heartbeat every ~30s (every 6 loop iterations at timeout=5s)
+            _hb_counter += 1
+            if _hb_counter >= 6:
+                _hb_counter = 0
+                await redis_client.set("worker:heartbeat", datetime.utcnow().isoformat(), ex=120)
+
             item = await redis_client.blpop(settings.JOB_QUEUE_KEY, timeout=5)
             if not item:
                 metrics_registry.set_gauge("job_queue_depth", float(await redis_client.llen(settings.JOB_QUEUE_KEY)))

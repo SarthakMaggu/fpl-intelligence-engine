@@ -195,6 +195,8 @@ export interface PriorityAction {
   reasoning: string;
   decision_type: string;
   recommended_option: string;
+  team_code?: number | null;
+  player_out_team_code?: number | null;
   confidence_score?: number;
   confidence_label?: "high" | "medium" | "low";
   risk_label?: "low" | "medium" | "high";
@@ -213,6 +215,8 @@ export interface PriorityActions {
   free_transfers: number;
   actions: PriorityAction[];
   total_actions: number;
+  gw_state?: "underway" | "pre_deadline" | "finished";
+  message?: string;
 }
 
 export interface GwIntelligence {
@@ -224,6 +228,13 @@ export interface GwIntelligence {
   blank_gw_starters: { player_id: number; web_name: string; team_code?: number | null }[];
   double_gw_players: { player_id: number; web_name: string; predicted_xpts_next: number; team_code?: number | null; team_short_name?: string | null }[];
   squad_size: number;
+  free_transfers: number;
+  zero_ft_advice?: {
+    bench_swaps: { out: { player_id: number; web_name: string; xpts: number; element_type: number; team_code?: number | null }; in: { player_id: number; web_name: string; xpts: number; element_type: number; team_code?: number | null }; gain: number }[];
+    chip_suggestion: { chip: string; reason: string; urgency: string } | null;
+    ilp_optimal_xi: { player_id: number; web_name: string; element_type: number; xpts: number }[];
+    verdict: "hold" | "bench_swap" | "chip";
+  } | null;
 }
 
 export interface LiveSquad {
