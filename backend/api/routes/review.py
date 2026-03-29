@@ -37,6 +37,10 @@ from services.cache_service import ANALYSIS_TTL, get_cached_payload, set_cached_
 
 router = APIRouter()
 
+# Decision types that are singletons: only ONE entry per (team, gw, decision_type).
+# Shared between get_gw_review and get_season_review so dedup is identical in both.
+SINGLETON_TYPES = {"captain_pick", "captain", "formation_change", "formation"}
+
 
 # ── Request/Response schemas ──────────────────────────────────────────────────
 
@@ -159,7 +163,6 @@ async def get_gw_review(
     #     decision so we keep the latest of each.
     # After dedup, limit to the 7 most recent decisions (matches the Oracle
     # output size so the audit shows exactly what the model recommended).
-    SINGLETON_TYPES = {"captain_pick", "captain", "formation_change", "formation"}
     seen: set[tuple] = set()
     deduplicated: list[DecisionLog] = []
     for l in sorted(logs, key=lambda x: x.created_at or "", reverse=True):
@@ -253,15 +256,19 @@ async def get_gw_review(
                         ).order_by(DecisionLog.created_at)
                     )
                     logs = log_res3.scalars().all()
-                    # Re-dedup
+                    # Re-dedup: same SINGLETON logic + 7-limit as the initial dedup above
                     seen2: set[tuple] = set()
                     deduped2: list[DecisionLog] = []
                     for l in sorted(logs, key=lambda x: x.created_at or "", reverse=True):
-                        key = (l.decision_type, l.recommended_option)
-                        if key not in seen2:
-                            seen2.add(key)
+                        dtype2 = (l.decision_type or "").lower().replace(" ", "_")
+                        if any(s in dtype2 for s in SINGLETON_TYPES):
+                            key2: tuple = (dtype2,)
+                        else:
+                            key2 = (dtype2, l.recommended_option)
+                        if key2 not in seen2:
+                            seen2.add(key2)
                             deduped2.append(l)
-                    logs = deduped2
+                    logs = deduped2[:7]
         except Exception as _gain_exc:
             logger.warning(f"actual_gain compute failed for GW{gw_id}: {_gain_exc}")
 
@@ -404,6 +411,36 @@ async def get_season_review(
                 .order_by(DecisionLog.gameweek_id)
             )
             all_logs = _log_res2.scalars().all()
+
+    # ── Per-GW dedup: same SINGLETON+7-limit as get_gw_review ──────────────────
+    # Apply this BEFORE computing any stats so that the season audit, by_type
+    # counts, and adherence rates all reflect the same set of decisions that
+    # the GW review page shows.  Without this dedup, stale/duplicate rows
+    # (e.g. two captain_pick rows when the recommendation changed mid-GW)
+    # inflate counts and create the brief↔review mismatch the user sees.
+    from collections import defaultdict as _dd_season
+    _logs_by_gw: dict[int, list[DecisionLog]] = _dd_season(list)
+    for _l in all_logs:
+        _logs_by_gw[_l.gameweek_id or 0].append(_l)
+
+    _deduped_all: list[DecisionLog] = []
+    for _gwk in sorted(_logs_by_gw.keys()):
+        _gw_bucket = _logs_by_gw[_gwk]
+        _seen_s: set[tuple] = set()
+        _deduped_s: list[DecisionLog] = []
+        for _l in sorted(_gw_bucket, key=lambda x: x.created_at or "", reverse=True):
+            _dtype_s = (_l.decision_type or "").lower().replace(" ", "_")
+            if any(s in _dtype_s for s in SINGLETON_TYPES):
+                _key_s: tuple = (_dtype_s,)
+            else:
+                _key_s = (_dtype_s, _l.recommended_option)
+            if _key_s not in _seen_s:
+                _seen_s.add(_key_s)
+                _deduped_s.append(_l)
+        _deduped_all.extend(_deduped_s[:7])
+
+    # Replace all_logs with the deduped view for all downstream computations.
+    all_logs = _deduped_all
 
     # resolved_logs: GWs fully resolved with actual points recorded
     resolved_logs = [l for l in all_logs if l.resolved and l.actual_points is not None]
@@ -601,15 +638,12 @@ async def get_season_review(
             "created_at": l.created_at.isoformat() if l.created_at else None,
         }
 
-    # Dedup: keep only the latest entry per (decision_type, recommended_option) across the season.
-    # This mirrors the GW review dedup logic so we don't show stale duplicates.
-    seen_season: set[tuple] = set()
-    audit_decisions: list[dict] = []
-    for l in sorted(all_logs, key=lambda x: (x.gameweek_id or 0, x.created_at or ""), reverse=True):
-        key = (l.gameweek_id, l.decision_type, l.recommended_option)
-        if key not in seen_season:
-            seen_season.add(key)
-            audit_decisions.append(_season_log_to_dict(l))
+    # all_logs is already deduped per-GW (SINGLETON+7-limit) above.
+    # Sort by GW ascending so the audit shows chronological order.
+    audit_decisions: list[dict] = [
+        _season_log_to_dict(l)
+        for l in sorted(all_logs, key=lambda x: (x.gameweek_id or 0, x.created_at or ""))
+    ]
 
     payload["decisions"] = audit_decisions
     await set_cached_payload("review_season", payload, ANALYSIS_TTL, team_id, session.session_token if session else "registered")

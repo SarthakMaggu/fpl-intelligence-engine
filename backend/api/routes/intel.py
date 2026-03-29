@@ -10,7 +10,7 @@ from models.db.player import Player
 from models.db.gameweek import Gameweek, Fixture
 from models.db.user_squad import UserSquad, UserBank
 from models.db.decision_log import DecisionLog
-from services.cache_service import ANALYSIS_TTL, FIXTURE_TTL, get_cached_payload, set_cached_payload
+from services.cache_service import ANALYSIS_TTL, FIXTURE_TTL, get_cached_payload, set_cached_payload, invalidate_cache_prefix
 from services.decision_engine import decision_engine, DecisionContext
 
 router = APIRouter()
@@ -930,6 +930,13 @@ async def get_priority_actions(
                     ))
 
         await db.commit()
+        # Invalidate review caches so the GW review and season audit immediately
+        # reflect the newly-written decisions (no stale data shown to the user).
+        try:
+            await invalidate_cache_prefix("review_gw")
+            await invalidate_cache_prefix("review_season")
+        except Exception:
+            pass  # cache invalidation is best-effort; never block the response
     except Exception as _log_exc:
         import logging as _logging
         _logging.getLogger(__name__).warning(f"Intel: failed to auto-log decisions: {_log_exc}")
